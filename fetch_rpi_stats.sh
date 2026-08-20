@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fetch_rpi_stats.sh — Daemon SSH que recoge estadísticas de las RPis cada 30s
-RPIS=("192.168.0.105" "192.168.0.193" "192.168.0.113" "192.168.0.80")
+RPIS=("192.168.0.105" "192.168.0.193" "192.168.0.80" "192.168.0.101" "192.168.0.102" "192.168.0.103" "192.168.0.221")
 INTERVAL=30
 TMPDIR="/tmp/conky_rpi"
 mkdir -p "$TMPDIR"

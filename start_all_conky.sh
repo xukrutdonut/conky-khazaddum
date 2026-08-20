@@ -54,11 +54,13 @@ sleep 1
 # ==============================================================================
 
 declare -A CONKY_INSTANCES=(
+    [khazaddum]="$CONKY_DIR/conky_khazaddum.conf"
     [rpi1]="$CONKY_DIR/conky_rpi1.conf"
     [rpi2]="$CONKY_DIR/conky_rpi2.conf"
-    [rpi3]="$CONKY_DIR/conky_rpi3.conf"
     [rpi4]="$CONKY_DIR/conky_rpi4.conf"
+    [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [copilot]="$CONKY_DIR/conky_copilot.conf"
+    [ollama]="$CONKY_DIR/conky_ollama.conf"
 )
 
 # ==============================================================================
