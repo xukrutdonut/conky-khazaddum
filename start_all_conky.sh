@@ -2,8 +2,12 @@
 set -euo pipefail
 
 # Unified Conky startup script for all instances
-# Manages: rpi1-4, copilot, khazaddum
-# Includes watchdog and dependency checks
+# Manages: khazaddum, rpi1, rpi2, rpi4, rpi3b, copilot, ollama
+# Includes lockfile, watchdog and dependency checks
+
+LOCKFILE="/tmp/start_all_conky.lock"
+exec 200>"$LOCKFILE"
+flock -n 200 || { echo "[$(date '+%H:%M:%S')] Another start_all_conky script is already running. Exiting."; exit 0; }
 
 CONKY_DIR="$HOME/.config/conky"
 LOG_DIR="$HOME/.local/share/conky"
@@ -40,13 +44,7 @@ sleep 2
 # ==============================================================================
 
 echo "[$(date '+%H:%M:%S')] Cleaning up old Conky instances..."
-for pid in $(pgrep -x conky); do
-    cmdline=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' || true)
-    # Don't kill if managed by systemd (will be started separately)
-    if ! echo "$cmdline" | grep -q "khazaddum"; then
-        kill "$pid" 2>/dev/null || true
-    fi
-done
+pkill -9 conky || true
 sleep 1
 
 # ==============================================================================
@@ -81,15 +79,6 @@ for name in "${!CONKY_INSTANCES[@]}"; do
         echo "[$(date '+%H:%M:%S')] WARNING: Config not found: $conf" | tee -a "$LOG_DIR/conky.log"
     fi
 done
-
-# ==============================================================================
-# START KHAZADDUM VIA SYSTEMD (if available)
-# ==============================================================================
-
-if systemctl --user is-enabled conky-khazaddum.service &>/dev/null; then
-    echo "[$(date '+%H:%M:%S')] Starting khazaddum via systemd..."
-    systemctl --user start conky-khazaddum.service || true
-fi
 
 # ==============================================================================
 # WATCHDOG LOOP (restart fallen instances every 30s)
