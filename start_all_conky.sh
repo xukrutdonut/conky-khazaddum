@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Unified Conky startup script for all instances
-# Manages: khazaddum, rpi1, rpi2, rpi4, rpi3b, copilot, ollama
-# Includes lockfile, watchdog and dependency checks
+# Manages: rpi1-4, copilot, khazaddum, ollama, lmstudio, etc.
+# Includes lockfile, dynamic display detection, watchdog and dependency checks
 
 LOCKFILE="/tmp/start_all_conky.lock"
 exec 200>"$LOCKFILE"
@@ -17,34 +17,68 @@ TMPDIR_RPi="/tmp/conky_rpi"
 mkdir -p "$LOG_DIR" "$TMPDIR_RPi"
 
 # ==============================================================================
+# DISPLAY & XAUTHORITY DETECTION
+# ==============================================================================
+
+if [ -z "${XAUTHORITY:-}" ]; then
+    MUTTER_AUTH=$(ls -t /run/user/$(id -u)/.mutter-Xwaylandauth.* 2>/dev/null | head -1)
+    if [ -n "$MUTTER_AUTH" ]; then
+        export XAUTHORITY="$MUTTER_AUTH"
+    fi
+fi
+
+DETECTED_DISPLAY=""
+for d in "${DISPLAY:-}" :0 :1 :2; do
+    if [ -n "$d" ] && DISPLAY="$d" xset q >/dev/null 2>&1; then
+        DETECTED_DISPLAY="$d"
+        break
+    fi
+done
+
+if [ -z "$DETECTED_DISPLAY" ]; then
+    echo "[$(date '+%H:%M:%S')] ERROR: Could not find active X11/Xwayland display. Exiting." | tee -a "$LOG_DIR/conky.log"
+    exit 1
+fi
+
+export DISPLAY="$DETECTED_DISPLAY"
+echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-default}" | tee -a "$LOG_DIR/conky.log"
+
+# ==============================================================================
+# PRE-CREATE DAEMON DATA
+# ==============================================================================
+
+touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat 2>/dev/null || true
+
+# Start Hailo stats daemon (feeds get_hailo_val.sh cache)
+pkill -f 'fetch_hailo_stats.sh' 2>/dev/null || true
+if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ]; then
+    setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
+    echo "[$(date '+%H:%M:%S')] Started Hailo stats daemon"
+fi
+
+# Start LM Studio stats daemon (feeds lmstudio_render.py cache)
+pkill -f 'fetch_lmstudio_stats.py' 2>/dev/null || true
+if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ]; then
+    setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
+    echo "[$(date '+%H:%M:%S')] Started LM Studio stats daemon"
+fi
+
+# ==============================================================================
 # DEPENDENCIES CHECK
 # ==============================================================================
 
-echo "[$(date '+%H:%M:%S')] Mounting Storage1TB if needed..."
 if ! mountpoint -q /media/arkantu/Storage1TB 2>/dev/null; then
-    for i in $(seq 1 10); do
-        mount /media/arkantu/Storage1TB 2>/dev/null && break
-        sleep 3
-    done
+    mount /media/arkantu/Storage1TB 2>/dev/null || true
 fi
-
-echo "[$(date '+%H:%M:%S')] Waiting for daemon data files..."
-for i in $(seq 1 9); do
-    if ls /tmp/conky_rpi/rpi_*.dat 2>/dev/null | head -1 | grep -q . && \
-       [ -f /tmp/conky_arc.dat ] && [ -f /tmp/conky_npu.dat ] && [ -f /tmp/conky_diskio.dat ] 2>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] All daemon data available."
-        break
-    fi
-    sleep 5
-done
-sleep 2
 
 # ==============================================================================
 # CLEANUP OLD INSTANCES
 # ==============================================================================
 
 echo "[$(date '+%H:%M:%S')] Cleaning up old Conky instances..."
-pkill -9 conky || true
+for pid in $(pgrep -x conky || true); do
+    kill -9 "$pid" 2>/dev/null || true
+done
 sleep 1
 
 # ==============================================================================
@@ -59,6 +93,7 @@ declare -A CONKY_INSTANCES=(
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [copilot]="$CONKY_DIR/conky_copilot.conf"
     [ollama]="$CONKY_DIR/conky_ollama.conf"
+    [lmstudio]="$CONKY_DIR/conky_lmstudio.conf"
 )
 
 # ==============================================================================
@@ -66,7 +101,6 @@ declare -A CONKY_INSTANCES=(
 # ==============================================================================
 
 echo "[$(date '+%H:%M:%S')] Launching Conky instances..."
-export DISPLAY=:0
 
 for name in "${!CONKY_INSTANCES[@]}"; do
     conf="${CONKY_INSTANCES[$name]}"
@@ -81,21 +115,45 @@ for name in "${!CONKY_INSTANCES[@]}"; do
 done
 
 # ==============================================================================
-# WATCHDOG LOOP (restart fallen instances every 30s)
+# WATCHDOG LOOP (with safety limit)
 # ==============================================================================
 
 echo "[$(date '+%H:%M:%S')] Watchdog started."
 
 (
+    declare -A FAIL_COUNTS
     while true; do
         sleep 30
+
+        # Verify display is still reachable
+        if ! DISPLAY="$DISPLAY" xset q >/dev/null 2>&1; then
+            echo "[$(date '+%H:%M:%S')] Display unreachable. Stopping watchdog." | tee -a "$LOG_DIR/conky.log"
+            break
+        fi
+
+        # Ensure helper daemons are running
+        if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ] && ! pgrep -f "fetch_hailo_stats.sh" > /dev/null 2>&1; then
+            setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
+        fi
+        if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ] && ! pgrep -f "fetch_lmstudio_stats.py" > /dev/null 2>&1; then
+            setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
+        fi
+
         for name in "${!CONKY_INSTANCES[@]}"; do
             conf="${CONKY_INSTANCES[$name]}"
             log="$LOG_DIR/conky_${name}.log"
             
-            if ! pgrep -f "conky.*${conf##*/}" > /dev/null 2>&1; then
-                echo "[$(date '+%H:%M:%S')] conky_${name} died, restarting..." | tee -a "$log"
-                setsid conky -c "$conf" >> "$log" 2>&1 &
+            if ! pgrep -f "$conf" > /dev/null 2>&1; then
+                cnt=${FAIL_COUNTS[$name]:-0}
+                if [ "$cnt" -lt 5 ]; then
+                    FAIL_COUNTS[$name]=$((cnt + 1))
+                    echo "[$(date '+%H:%M:%S')] conky_${name} died (attempt $((cnt+1))/5), restarting..." | tee -a "$log"
+                    setsid conky -c "$conf" >> "$log" 2>&1 &
+                else
+                    echo "[$(date '+%H:%M:%S')] ERROR: conky_${name} failed 5 times, giving up." | tee -a "$log"
+                fi
+            else
+                FAIL_COUNTS[$name]=0
             fi
         done
     done

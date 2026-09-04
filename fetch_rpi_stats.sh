@@ -25,14 +25,14 @@ mapfile -t _c1 < <(awk '/^cpu[0-9]/{
     printf "%d %d %d\n",n,total,idle
 }' /proc/stat)
 read -r _rx1 _tx1 < <(awk '$1~/^eth|^enp|^end|^wl/{print $2,$10;exit}' /proc/net/dev)
-read -r _diskr1 _diskw1 < <(awk '$3~/^(sd[a-z]|hd[a-z]|mmcblk[0-9]+|nvme[0-9]+n[0-9]+|vd[a-z])$/{r+=$6;w+=$10}END{print r+0,w+0}' /proc/diskstats)
+read -r _diskr1 _diskw1 < <(awk '$3~/^(sd[a-z]|hd[a-z]|mmcblk[0-9]+|nvme[0-9]+n[0-9]+|vd[a-z])$/{r+=$6;w+=$10}END{printf "%.0f %.0f\n",r+0,w+0}' /proc/diskstats)
 sleep 1
 mapfile -t _c2 < <(awk '/^cpu[0-9]/{
     total=$2+$3+$4+$5+$6+$7+$8; idle=$5+$6; n=substr($1,4)+0
     printf "%d %d %d\n",n,total,idle
 }' /proc/stat)
 read -r _rx2 _tx2 < <(awk '$1~/^eth|^enp|^end|^wl/{print $2,$10;exit}' /proc/net/dev)
-read -r _diskr2 _diskw2 < <(awk '$3~/^(sd[a-z]|hd[a-z]|mmcblk[0-9]+|nvme[0-9]+n[0-9]+|vd[a-z])$/{r+=$6;w+=$10}END{print r+0,w+0}' /proc/diskstats)
+read -r _diskr2 _diskw2 < <(awk '$3~/^(sd[a-z]|hd[a-z]|mmcblk[0-9]+|nvme[0-9]+n[0-9]+|vd[a-z])$/{r+=$6;w+=$10}END{printf "%.0f %.0f\n",r+0,w+0}' /proc/diskstats)
 
 # --- CPU total % ---
 read -r _ct1 _ci1 < <(awk '/^cpu /{total=$2+$3+$4+$5+$6+$7+$8;idle=$5+$6;print total,idle;exit}' /proc/stat)

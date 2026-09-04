@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
-"""
-Genera /tmp/ollama_pie.png compacto:
-  - Donuts de tamaño reducido para ahorro de espacio
-  - Tiempos de reinicio claros y legibles
-  - Sin pie de cuenta para maximizar el espacio libre
-"""
-
 import math
 import subprocess
 import json
 import os
 import sys
+import urllib.request
 from datetime import datetime, timezone
 from PIL import Image, ImageDraw, ImageFont
 
-# ── Configuración visual ──────────────────────────────────────────
 W, H       = 350, 210
-BG         = (0, 0, 0, 0)           # transparente
-TRACK_RGBA = (255, 255, 255, 35)    # anillo de fondo
+BG         = (0, 0, 0, 0)
+TRACK_RGBA = (255, 255, 255, 35)
 WHITE      = (255, 255, 255, 235)
 GREY       = (160, 160, 160, 180)
 DIVIDER    = (130, 200, 255, 40)
@@ -35,15 +28,15 @@ CACHE_FILE = '/tmp/ollama_quota_cache.json'
 
 DEFAULT_DATA = {
     "daily": {
-        "remaining_pct": 85.0,
-        "used_tokens": 150000,
+        "remaining_pct": 95.0,
+        "used_tokens": 50000,
         "limit_tokens": 1000000,
         "reset_time": "04:00",
-        "reset_in": "5h 12m"
+        "reset_in": "5h 10m"
     },
     "weekly": {
-        "remaining_pct": 68.0,
-        "used_tokens": 6400000,
+        "remaining_pct": 85.0,
+        "used_tokens": 3000000,
         "limit_tokens": 20000000,
         "reset_time": "Lun 00:00",
         "reset_in": "3d 14h"
@@ -80,9 +73,7 @@ def format_tokens(num):
         return f'{num / 1_000:.0f}K'
     return str(num)
 
-# ── Helpers PIL ──────────────────────────────────────────────────
 def arc_rgba(img, cx, cy, r, lw, start_deg, end_deg, color):
-    """Dibuja un arco antialiased perfectamente circular."""
     S = 4
     ow, oh = img.size
     big = Image.new('RGBA', (ow * S, oh * S), (0, 0, 0, 0))
@@ -134,7 +125,6 @@ def draw_donut(img, cx, cy, R, pct, label, sublabel, clr):
         fnt3 = ImageFont.load_default()
     text_centered(draw, sublabel, cx, cy + R + 23, fnt3, GREY)
 
-# ── Renderizado Principal Compacto ────────────────────────────────
 data = fetch_data()
 
 daily_data  = data.get("daily", {})
@@ -152,42 +142,36 @@ weekly_sub = f"{format_tokens(max(0, weekly_rem_tok))} rest."
 img  = Image.new('RGBA', (W, H), BG)
 draw = ImageDraw.Draw(img)
 
-# Donuts compactos
-R  = 48
-cy = 58
+R  = 46
+cy = 54
 cx1, cx2 = W // 4, W * 3 // 4
 
-# Divisor vertical entre donuts
 draw.line([(W // 2, 6), (W // 2, cy + R + 28)], fill=DIVIDER, width=1)
 
 draw_donut(img, cx1, cy, R, daily_pct,  'DIARIO',  daily_sub,  quota_color(daily_pct))
 draw_donut(img, cx2, cy, R, weekly_pct, 'SEMANAL', weekly_sub, quota_color(weekly_pct))
 
-# Separador horizontal
-sep_y = cy + R + 34
+sep_y = cy + R + 32
 draw.line([(4, sep_y), (W - 4, sep_y)], fill=DIVIDER, width=1)
 
-# Fuentes para detalles de reset (Letra grande de Reset)
 try:
-    fnt_reset = ImageFont.truetype(FONT_BOLD, 12)
+    fnt_reset = ImageFont.truetype(FONT_BOLD, 11)
 except Exception:
     fnt_reset = ImageFont.load_default()
 
-# Tiempos de reinicio sin pie de cuenta para ahorro de espacio
 y = sep_y + 8
-d_reset_time = daily_data.get("reset_time", "—")
-d_reset_in   = daily_data.get("reset_in", "—")
-w_reset_time = weekly_data.get("reset_time", "—")
-w_reset_in   = weekly_data.get("reset_in", "—")
+d_reset_time = daily_data.get("reset_time", "04:00 (UTC)")
+d_reset_in   = daily_data.get("reset_in", "5h 10m")
+w_reset_time = weekly_data.get("reset_time", "Lun 00:00")
+w_reset_in   = weekly_data.get("reset_in", "3d 14h")
 
 reset_line1 = f"↺ Reset Diario : {d_reset_time} ({d_reset_in})"
 reset_line2 = f"↺ Reset Semanal: {w_reset_time} ({w_reset_in})"
 
 draw.text((12, y), reset_line1, font=fnt_reset, fill=BLUE)
-y += 22
+y += 20
 draw.text((12, y), reset_line2, font=fnt_reset, fill=BLUE)
 
-# Guardar imagen resultante
 tmp = OUTPUT + '.tmp'
 img.save(tmp, format='PNG')
 os.replace(tmp, OUTPUT)

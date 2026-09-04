@@ -21,10 +21,7 @@ case "${1:-freq}" in
         [ -f "$f" ] && awk '{printf "%.0f°C", $1/1000}' "$f" || echo "N/A"
         ;;
     cpu_temp)
-        # hwmon2 = coretemp, temp1 = Package id 0
-        f="/sys/class/hwmon/hwmon2/temp1_input"
-        [ -f "$f" ] && awk '{printf "%.0f°C", $1/1000}' "$f" || \
-            awk '{printf "%.0f°C", $1/1000}' /sys/class/thermal/thermal_zone1/temp 2>/dev/null || \
-            echo "N/A"
+        # coretemp Package id 0 / thermal zone
+        awk '{printf "%.0f°C", $1/1000; exit}' /sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input /sys/class/thermal/thermal_zone1/temp 2>/dev/null || echo "N/A"
         ;;
 esac
