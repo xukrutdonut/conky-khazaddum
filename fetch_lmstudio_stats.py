@@ -5,10 +5,11 @@ import subprocess
 import re
 import time
 import glob
+import socket
 
 DAT_FILE = '/tmp/conky_lmstudio.dat'
 SPEED_TRACKER = '/tmp/conky_lmstudio_speed_tracker.json'
-INTERVAL = 1.0
+INTERVAL = 3.5
 
 def load_speed_tracker():
     if os.path.exists(SPEED_TRACKER):
@@ -64,6 +65,30 @@ def tail_lines(filepath, n=3000):
 last_known_models = []
 last_online_time = 0.0
 
+API_PORTS = [41343, 52993, 16141, 39414, 22931]
+
+def is_lmstudio_running():
+    for pid_dir in os.listdir('/proc'):
+        if not pid_dir.isdigit():
+            continue
+        try:
+            with open(f'/proc/{pid_dir}/cmdline', 'rb') as f:
+                cmd = f.read().decode('utf-8', errors='ignore')
+                if ('lm-studio' in cmd or 'LM-Studio' in cmd) and 'fetch_lmstudio' not in cmd:
+                    return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return False
+
+def is_lmstudio_api_ready():
+    for port in API_PORTS:
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=0.15):
+                return True
+        except (OSError, ConnectionRefusedError):
+            continue
+    return False
+
 def collect():
     global last_known_models, last_online_time
     speed_tracker = load_speed_tracker()
@@ -71,6 +96,32 @@ def collect():
 
     online = False
     models = []
+
+    if not is_lmstudio_running():
+        dat_lines.append("STATE:OFFLINE")
+        dat_lines.append("ONLINE:0")
+        dat_lines.append("NUM_MODELS:0")
+        dat_lines.append("LOGS:${color6}(LM Studio no iniciado)${color}")
+        try:
+            with open(DAT_FILE + '.tmp', 'w') as f:
+                f.write("\n".join(dat_lines) + "\n")
+            os.replace(DAT_FILE + '.tmp', DAT_FILE)
+        except Exception:
+            pass
+        return
+
+    if not is_lmstudio_api_ready():
+        dat_lines.append("STATE:INICIANDO")
+        dat_lines.append("ONLINE:0")
+        dat_lines.append("NUM_MODELS:0")
+        dat_lines.append("LOGS:${color5}(LM Studio iniciando...)${color}")
+        try:
+            with open(DAT_FILE + '.tmp', 'w') as f:
+                f.write("\n".join(dat_lines) + "\n")
+            os.replace(DAT_FILE + '.tmp', DAT_FILE)
+        except Exception:
+            pass
+        return
 
     try:
         r = subprocess.run(

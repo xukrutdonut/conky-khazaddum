@@ -67,9 +67,7 @@ fi
 # DEPENDENCIES CHECK
 # ==============================================================================
 
-if ! mountpoint -q /media/arkantu/Storage1TB 2>/dev/null; then
-    mount /media/arkantu/Storage1TB 2>/dev/null || true
-fi
+# (Storage1TB ya no existe como dispositivo separado — el NVMe 1TB está en /)
 
 # ==============================================================================
 # CLEANUP OLD INSTANCES
@@ -105,6 +103,7 @@ echo "[$(date '+%H:%M:%S')] Launching Conky instances..."
 for name in "${!CONKY_INSTANCES[@]}"; do
     conf="${CONKY_INSTANCES[$name]}"
     log="$LOG_DIR/conky_${name}.log"
+    # (khazaddum ya no usa circuit breaker permanente — get_amdgpu_val.sh usa cooldown temporal)
     if [ -f "$conf" ]; then
         setsid conky -c "$conf" >> "$log" 2>&1 &
         echo "[$(date '+%H:%M:%S')] Started conky_${name}"
@@ -144,6 +143,7 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
             log="$LOG_DIR/conky_${name}.log"
             
             if ! pgrep -f "$conf" > /dev/null 2>&1; then
+            # (khazaddum usa cooldown temporal en get_amdgpu_val.sh, no flag permanente)
                 cnt=${FAIL_COUNTS[$name]:-0}
                 if [ "$cnt" -lt 5 ]; then
                     FAIL_COUNTS[$name]=$((cnt + 1))

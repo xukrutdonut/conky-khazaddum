@@ -158,20 +158,25 @@ for _card in /sys/class/drm/card*/device; do
 done
 
 # --- Hailo PCIe ---
-HAILO_STATE="N/A"
-for _pf in /sys/bus/pci/devices/*/power_state; do
-    _dev=$(dirname "$_pf")
-    if ls "$_dev/" 2>/dev/null | grep -q hailo; then
-        HAILO_STATE=$(cat "$_pf" 2>/dev/null || echo "N/A")
+HAILO_STATE="no-detectado"; HAILO_SLOT="N/A"; HAILO_POWER="N/A"; HAILO_TEMP="0"; HAILO_UTIL="0"
+for _pf in /sys/bus/pci/devices/*/; do
+    if [ -f "${_pf}uevent" ] && grep -qi "1e60" "${_pf}uevent" 2>/dev/null; then
+        HAILO_SLOT=$(basename "$_pf")
+        if [ -e /dev/hailo0 ]; then
+            HAILO_STATE="activo"
+        elif [ -d "${_pf}driver" ]; then
+            HAILO_STATE="driver-ok"
+        else
+            HAILO_STATE="sin-driver"
+        fi
+        HAILO_POWER=$(cat "${_pf}power_state" 2>/dev/null || echo "D0")
         break
     fi
 done
-if [[ "$HAILO_STATE" == "N/A" ]]; then
-    _pf=$(find /sys/bus/pci/devices -name power_state 2>/dev/null | head -1)
-    # Check if hailo device exists differently
-    if [[ -e /dev/hailo0 ]]; then
-        HAILO_STATE=$(cat /sys/bus/pci/devices/0001:01:00.0/power_state 2>/dev/null || echo "activo")
-    fi
+if [[ "$HAILO_STATE" == "no-detectado" && -e /dev/hailo0 ]]; then
+    HAILO_STATE="activo"
+    HAILO_SLOT="hailo0"
+    HAILO_POWER="D0"
 fi
 
 # --- Salida ---
@@ -206,6 +211,10 @@ echo "VRAMUSEDMB:$VRAM_USED_MB"
 echo "VRAMTOTALMB:$VRAM_TOTAL_MB"
 echo "GPUFREQ:$GPU_FREQ"
 echo "HAILOSTATE:$HAILO_STATE"
+echo "HAILOSLOT:$HAILO_SLOT"
+echo "HAILOPOWER:$HAILO_POWER"
+echo "HAILOTEMP:$HAILO_TEMP"
+echo "HAILOUTIL:$HAILO_UTIL"
 REMOTE
     )
     local EXIT=$?

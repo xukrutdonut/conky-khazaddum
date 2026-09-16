@@ -39,12 +39,17 @@ def render():
     print("${color4}${alignc}LM STUDIO SERVER${color}")
     if online:
         print(f"${{color1}}${{alignc}}localhost:1234 — ${{color2}}{state}${{color}}")
+    elif state == 'INICIANDO':
+        print("${color1}${alignc}localhost:1234 — ${color5}INICIANDO...${color}")
     else:
         print("${color1}${alignc}localhost:1234 — ${color3}OFFLINE${color}")
     print("${hr 1}")
 
     if not online:
-        print("${color6}${alignc}(Servidor no iniciado)${color}")
+        if state == 'INICIANDO':
+            print("${color5}${alignc}(Iniciando entorno y modelos...)${color}")
+        else:
+            print("${color6}${alignc}(Servidor no iniciado)${color}")
     elif num_models == 0:
         print("${color6}${alignc}(Sin modelos cargados en memoria)${color}")
     else:
