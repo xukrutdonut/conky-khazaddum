@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daemon: monitoriza el estado real de Ollama Cloud.
+Daemon: monitoriza el estado real de Ollama Cloud + usage de la cuenta.
 Escribe /tmp/ollama_cloud_stats.json atomicamente cada 60s.
 
 Chequeos reales:
@@ -9,6 +9,7 @@ Chequeos reales:
   3. Modelos cargados en memoria (/api/ps)
   4. Latencia real del cloud: genera 1 token con el primer modelo cloud
   5. Score de salud 0-100 combinando todo
+  6. API /api/usage de ollama.com: session/weekly usage, requests, coste
 """
 import json, os, time, urllib.request, urllib.error, socket
 from datetime import datetime
@@ -18,19 +19,37 @@ OLLAMA_URL   = 'http://localhost:11434'
 POLL_INTERVAL = 60
 CLOUD_HOST   = 'ollama.com'
 CLOUD_PORT   = 443
+USAGE_API    = 'https://ollama.com/api/usage'
+ENV_FILE     = '/home/arkantu/.hermes/.env'
 
 
-def timed_request(url, timeout=10, data=None):
+def get_api_key():
+    """Lee OLLAMA_API_KEY del .env de hermes."""
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('OLLAMA_API_KEY='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return os.environ.get('OLLAMA_API_KEY', '')
+
+
+def timed_request(url, timeout=10, data=None, headers=None):
     t0 = time.monotonic()
     try:
+        hdrs = {'Content-Type': 'application/json'}
+        if headers:
+            hdrs.update(headers)
         if data is not None:
             req = urllib.request.Request(
                 url,
                 data=json.dumps(data).encode(),
-                headers={'Content-Type': 'application/json'},
+                headers=hdrs,
             )
         else:
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, headers=hdrs)
         resp = urllib.request.urlopen(req, timeout=timeout)
         elapsed = (time.monotonic() - t0) * 1000
         body = json.loads(resp.read().decode())
@@ -84,7 +103,6 @@ def check_cloud_latency(model_name, timeout=20):
         eval_count = resp.get('eval_count', 0)
         eval_duration = resp.get('eval_duration', 0)
         total_duration = resp.get('total_duration', 0)
-        # tokens/s del cloud
         if eval_duration > 0 and eval_count > 0:
             tps = eval_count / (eval_duration / 1e9)
         else:
@@ -102,6 +120,15 @@ def check_cloud_reachable():
         return True, int((time.monotonic() - t0) * 1000)
     except Exception:
         return False, int((time.monotonic() - t0) * 1000)
+
+
+def fetch_usage(api_key):
+    """Llama a https://ollama.com/api/usage con el Bearer token."""
+    if not api_key:
+        return False, 0, None
+    headers = {'Authorization': f'Bearer {api_key}'}
+    ok, lat, data = timed_request(USAGE_API, timeout=10, headers=headers)
+    return ok, lat, data
 
 
 def compute_health(server_up, server_lat, cloud_models, cloud_ok, cloud_lat, cloud_reachable):
@@ -142,6 +169,16 @@ def collect():
         'health': 0,
         'status': 'CAIDO',
         'active_model': '',
+        # Usage data from ollama.com/api/usage
+        'usage_ok': False,
+        'session_usage_pct': 0.0,
+        'session_requests': 0,
+        'session_models': [],
+        'weekly_usage_pct': 0.0,
+        'weekly_requests': 0,
+        'weekly_models': [],
+        'total_cost': '',
+        'activity_models': [],
     }
 
     server_ok, server_lat, tags_data = check_server()
@@ -157,12 +194,10 @@ def collect():
         stats['loaded_models'] = [m['name'] for m in loaded]
         stats['loaded_count'] = len(loaded)
 
-        # TCP reachability al cloud (sin consumir tokens)
         reachable, tcp_ms = check_cloud_reachable()
         stats['cloud_reachable'] = reachable
         stats['cloud_tcp_ms'] = tcp_ms
 
-        # Latencia real: generar 1 token con el primer modelo cloud
         if cloud_models:
             model_name = cloud_models[0]['name']
             stats['active_model'] = model_name
@@ -171,6 +206,29 @@ def collect():
             stats['cloud_latency_ms'] = cloud_lat
             if cloud_info:
                 stats['cloud_tps'] = round(cloud_info.get('tps', 0), 1)
+
+    # Fetch usage data from ollama.com API
+    api_key = get_api_key()
+    usage_ok, usage_lat, usage_data = fetch_usage(api_key)
+    stats['usage_ok'] = usage_ok
+    if usage_ok and usage_data:
+        limits = usage_data.get('limits', {})
+        session = limits.get('session', {})
+        weekly = limits.get('weekly', {})
+        activity = usage_data.get('activity', {})
+
+        stats['session_usage_pct'] = round(session.get('usage', 0) * 100, 1)
+        session_models = session.get('models', [])
+        stats['session_models'] = session_models
+        stats['session_requests'] = sum(m.get('request_count', 0) for m in session_models)
+
+        stats['weekly_usage_pct'] = round(weekly.get('usage', 0) * 100, 1)
+        weekly_models = weekly.get('models', [])
+        stats['weekly_models'] = weekly_models
+        stats['weekly_requests'] = sum(m.get('request_count', 0) for m in weekly_models)
+
+        stats['total_cost'] = activity.get('cost', '')
+        stats['activity_models'] = activity.get('models', [])
 
     health = compute_health(
         stats['server_up'], stats['server_latency_ms'],
@@ -197,7 +255,6 @@ def main():
                 json.dump(stats, f, indent=2)
             os.replace(tmp, STATS_FILE)
         except Exception as e:
-            # No morir nunca, el watchdog depende de esto
             pass
         time.sleep(POLL_INTERVAL)
 

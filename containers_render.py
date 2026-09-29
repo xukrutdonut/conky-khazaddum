@@ -1,10 +1,27 @@
 #!/usr/bin/env python3
 """Render para conky: muestra estado de contenedores IA (Intel OpenVINO + AMD RX480)."""
 import os
+import stat
 
 DAT_FILE = '/tmp/conky_containers.dat'
 
+def ensure_helper(path, key):
+    """Crea un script helper en /tmp que extrae un valor del .dat para execbar."""
+    content = f"#!/bin/sh\nawk -F: '$1==\"{key}\" {{print $2; exit}}' {DAT_FILE}\n"
+    needs_write = True
+    if os.path.exists(path):
+        with open(path) as f:
+            needs_write = f.read() != content
+    if needs_write:
+        with open(path, 'w') as f:
+            f.write(content)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
 def render():
+    # Asegurar scripts helper para las barras
+    ensure_helper('/tmp/conky_intel_tps.sh', 'INTEL_TPS_PCT')
+    ensure_helper('/tmp/conky_amd_tps.sh', 'AMD_TPS_PCT')
+
     if not os.path.exists(DAT_FILE):
         print("${color4}${alignc}IA CONTAINERS${color}")
         print("${color1}${alignc}Esperando datos...${color}")
@@ -90,6 +107,7 @@ def render():
         else:
             print("${color5}(Sin modelos cargados)${color}")
         print(f"${{color1}}Velocidad: ${{color2}}{tps_txt}${{color}}")
+        print(f"${{execbar 4,344 /tmp/conky_amd_tps.sh}}")
 
 if __name__ == '__main__':
     render()
