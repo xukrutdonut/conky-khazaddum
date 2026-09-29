@@ -70,6 +70,13 @@ if [ -x "$CONKY_DIR/fetch_ollama_cloud_stats.py" ]; then
     echo "[$(date '+%H:%M:%S')] Started Ollama Cloud stats daemon"
 fi
 
+# Start IA Containers stats daemon (feeds containers_render.py cache)
+pkill -f 'fetch_containers_stats\.py' 2>/dev/null || true
+if [ -x "$CONKY_DIR/fetch_containers_stats.py" ]; then
+    setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
+    echo "[$(date '+%H:%M:%S')] Started IA Containers stats daemon"
+fi
+
 # ==============================================================================
 # DEPENDENCIES CHECK
 # ==============================================================================
@@ -96,6 +103,7 @@ declare -A CONKY_INSTANCES=(
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [ollama]="$CONKY_DIR/conky_ollama.conf"
     [lmstudio]="$CONKY_DIR/conky_lmstudio.conf"
+    [containers]="$CONKY_DIR/conky_containers.conf"
 )
 
 # ==============================================================================
@@ -143,6 +151,9 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
         fi
         if [ -x "$CONKY_DIR/fetch_ollama_cloud_stats.py" ] && ! pgrep -f 'fetch_ollama_cloud_stats\.py' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_ollama_cloud_stats.py" >> "$LOG_DIR/conky_ollama_daemon.log" 2>&1 &
+        fi
+        if [ -x "$CONKY_DIR/fetch_containers_stats.py" ] && ! pgrep -f 'fetch_containers_stats\.py' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
         fi
 
         for name in "${!CONKY_INSTANCES[@]}"; do
