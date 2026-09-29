@@ -1,83 +1,68 @@
 #!/usr/bin/env python3
-import math
-import subprocess
-import json
-import os
-import sys
-import urllib.request
-from datetime import datetime, timezone
+"""
+Genera /tmp/ollama_pie.png - dashboard real de Ollama Cloud.
+Lee /tmp/ollama_cloud_stats.json (escrito por fetch_ollama_cloud_stats.py).
+
+Muestra:
+  - Donut principal: score de salud general (0-100)
+  - 4 metricas clave: servidor, cloud, latencia, modelos
+  - Estado textual: OK / DEGRADADO / CAIDO
+  - Modelo activo + TPS
+"""
+import json, os, time
+from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
-W, H       = 350, 210
-BG         = (0, 0, 0, 0)
+W, H = 350, 230
+BG = (0, 0, 0, 0)
 TRACK_RGBA = (255, 255, 255, 35)
-WHITE      = (255, 255, 255, 235)
-GREY       = (160, 160, 160, 180)
-DIVIDER    = (130, 200, 255, 40)
+WHITE = (255, 255, 255, 235)
+GREY = (160, 160, 160, 180)
+DIVIDER = (130, 200, 255, 40)
 
-GREEN  = (90,  247, 142, 230)
-ORANGE = (255, 179,  71, 230)
-RED    = (255, 110, 110, 230)
+GREEN = (90, 247, 142, 230)
+ORANGE = (255, 179, 71, 230)
+RED = (255, 110, 110, 230)
 GREY_C = (136, 136, 136, 200)
-BLUE   = (94, 184, 255, 235)
+BLUE = (94, 184, 255, 235)
 
 FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf'
-FONT_REG  = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'
-OUTPUT    = '/tmp/ollama_pie.png'
-CACHE_FILE = '/tmp/ollama_quota_cache.json'
+FONT_REG = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'
+OUTPUT = '/tmp/ollama_pie.png'
+STATS_FILE = '/tmp/ollama_cloud_stats.json'
 
-DEFAULT_DATA = {
-    "daily": {
-        "remaining_pct": 95.0,
-        "used_tokens": 50000,
-        "limit_tokens": 1000000,
-        "reset_time": "04:00",
-        "reset_in": "5h 10m"
-    },
-    "weekly": {
-        "remaining_pct": 85.0,
-        "used_tokens": 3000000,
-        "limit_tokens": 20000000,
-        "reset_time": "Lun 00:00",
-        "reset_in": "3d 14h"
-    },
-    "updated_at": datetime.now(timezone.utc).isoformat()
-}
 
-def fetch_data():
-    if os.path.exists(CACHE_FILE):
+def load_stats():
+    if os.path.exists(STATS_FILE):
         try:
-            with open(CACHE_FILE, 'r') as f:
-                return json.load(f)
+            with open(STATS_FILE) as f:
+                data = json.load(f)
+                age = time.time() - os.path.getmtime(STATS_FILE)
+                data['_age_s'] = int(age)
+                return data
         except Exception:
             pass
+    return None
 
-    try:
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(DEFAULT_DATA, f, indent=2)
-    except Exception:
-        pass
-    return DEFAULT_DATA
 
-def quota_color(p):
+def health_color(p):
     if p is None: return GREY_C
-    if p < 20:    return RED
-    if p < 40:    return ORANGE
+    if p < 40: return RED
+    if p < 70: return ORANGE
     return GREEN
 
-def format_tokens(num):
-    if num is None: return '—'
-    if num >= 1_000_000:
-        return f'{num / 1_000_000:.1f}M'
-    if num >= 1_000:
-        return f'{num / 1_000:.0f}K'
-    return str(num)
+
+def status_text(status):
+    if status == 'OK': return 'OPERATIVO', GREEN
+    if status == 'DEGRADADO': return 'DEGRADADO', ORANGE
+    return 'CAIDO', RED
+
 
 def arc_rgba(img, cx, cy, r, lw, start_deg, end_deg, color):
     S = 4
     ow, oh = img.size
     big = Image.new('RGBA', (ow * S, oh * S), (0, 0, 0, 0))
-    d   = ImageDraw.Draw(big)
+    d = ImageDraw.Draw(big)
     bx, by = cx * S, cy * S
     br = r * S
     blw = max(1, lw * S)
@@ -86,91 +71,161 @@ def arc_rgba(img, cx, cy, r, lw, start_deg, end_deg, color):
     small = big.resize((ow, oh), Image.LANCZOS)
     img.alpha_composite(small)
 
+
 def text_centered(draw, text, cx, cy, font, color):
     bb = draw.textbbox((0, 0), text, font=font)
     tw = bb[2] - bb[0]
     th = bb[3] - bb[1]
     draw.text((cx - tw // 2, cy - th // 2), text, font=font, fill=color)
 
+
+def text_left(draw, text, x, y, font, color):
+    draw.text((x, y), text, font=font, fill=color)
+
+
 def draw_donut(img, cx, cy, R, pct, label, sublabel, clr):
-    LW   = int(R * 0.28)
+    LW = int(R * 0.28)
     DEG0 = -90
-
     arc_rgba(img, cx, cy, R - LW // 2, LW, 0, 360, TRACK_RGBA)
-
     capped = max(0.0, min(pct if pct is not None else 0.0, 100.0))
     if capped > 0.5:
         sweep = capped / 100.0 * 360.0
         arc_rgba(img, cx, cy, R - LW // 2, LW, DEG0, DEG0 + sweep, clr)
-
     draw = ImageDraw.Draw(img)
-
-    txt = f'{capped:.0f}%' if pct is not None else 'N/A'
-    fs  = max(12, int(R * 0.35))
+    txt = f'{capped:.0f}' if pct is not None else 'N/A'
+    fs = max(14, int(R * 0.42))
     try:
         fnt = ImageFont.truetype(FONT_BOLD, fs)
     except Exception:
         fnt = ImageFont.load_default()
-    text_centered(draw, txt, cx, cy, fnt, WHITE)
-
+    text_centered(draw, txt, cx, cy - 4, fnt, WHITE)
     try:
-        fnt2 = ImageFont.truetype(FONT_BOLD, 11)
+        fnt_pct = ImageFont.truetype(FONT_REG, 9)
+    except Exception:
+        fnt_pct = ImageFont.load_default()
+    text_centered(draw, '/100', cx, cy + fs // 2 + 2, fnt_pct, GREY)
+    try:
+        fnt2 = ImageFont.truetype(FONT_BOLD, 10)
     except Exception:
         fnt2 = ImageFont.load_default()
     text_centered(draw, label, cx, cy + R + 11, fnt2, clr)
-
     try:
-        fnt3 = ImageFont.truetype(FONT_REG, 9)
+        fnt3 = ImageFont.truetype(FONT_REG, 8)
     except Exception:
         fnt3 = ImageFont.load_default()
-    text_centered(draw, sublabel, cx, cy + R + 23, fnt3, GREY)
+    text_centered(draw, sublabel, cx, cy + R + 22, fnt3, GREY)
 
-data = fetch_data()
 
-daily_data  = data.get("daily", {})
-weekly_data = data.get("weekly", {})
+def draw_check(draw, x, y, ok, font, label):
+    icon = '\u2713' if ok else '\u2717'
+    clr = GREEN if ok else RED
+    text_left(draw, f'{icon} ', x, y, font, clr)
+    text_left(draw, label, x + 16, y, font, WHITE if ok else GREY)
 
-daily_pct   = daily_data.get("remaining_pct", 100.0)
-weekly_pct  = weekly_data.get("remaining_pct", 100.0)
 
-daily_rem_tok  = daily_data.get("limit_tokens", 0) - daily_data.get("used_tokens", 0)
-weekly_rem_tok = weekly_data.get("limit_tokens", 0) - weekly_data.get("used_tokens", 0)
+def fmt_ms(ms):
+    if ms is None or ms == 0: return '\u2014'
+    if ms >= 1000: return f'{ms/1000:.1f}s'
+    return f'{ms}ms'
 
-daily_sub  = f"{format_tokens(max(0, daily_rem_tok))} rest."
-weekly_sub = f"{format_tokens(max(0, weekly_rem_tok))} rest."
 
-img  = Image.new('RGBA', (W, H), BG)
+# ─── Main ──────────────────────────────────────────────────────────
+
+stats = load_stats()
+
+img = Image.new('RGBA', (W, H), BG)
 draw = ImageDraw.Draw(img)
 
-R  = 46
-cy = 54
-cx1, cx2 = W // 4, W * 3 // 4
-
-draw.line([(W // 2, 6), (W // 2, cy + R + 28)], fill=DIVIDER, width=1)
-
-draw_donut(img, cx1, cy, R, daily_pct,  'DIARIO',  daily_sub,  quota_color(daily_pct))
-draw_donut(img, cx2, cy, R, weekly_pct, 'SEMANAL', weekly_sub, quota_color(weekly_pct))
-
-sep_y = cy + R + 32
-draw.line([(4, sep_y), (W - 4, sep_y)], fill=DIVIDER, width=1)
-
 try:
-    fnt_reset = ImageFont.truetype(FONT_BOLD, 11)
+    fnt_bold_11 = ImageFont.truetype(FONT_BOLD, 11)
+    fnt_bold_10 = ImageFont.truetype(FONT_BOLD, 10)
+    fnt_reg_10 = ImageFont.truetype(FONT_REG, 10)
+    fnt_reg_9 = ImageFont.truetype(FONT_REG, 9)
+    fnt_reg_8 = ImageFont.truetype(FONT_REG, 8)
 except Exception:
-    fnt_reset = ImageFont.load_default()
+    fnt_bold_11 = fnt_bold_10 = fnt_reg_10 = fnt_reg_9 = fnt_reg_8 = ImageFont.load_default()
 
-y = sep_y + 8
-d_reset_time = daily_data.get("reset_time", "04:00 (UTC)")
-d_reset_in   = daily_data.get("reset_in", "5h 10m")
-w_reset_time = weekly_data.get("reset_time", "Lun 00:00")
-w_reset_in   = weekly_data.get("reset_in", "3d 14h")
+if stats is None:
+    # Sin datos - el daemon no ha corrido
+    text_centered(draw, 'SIN DATOS', W // 2, 80, fnt_bold_11, RED)
+    text_centered(draw, 'Daemon no inicializado', W // 2, 100, fnt_reg_9, GREY)
+    tmp = OUTPUT + '.tmp'
+    img.save(tmp, format='PNG')
+    os.replace(tmp, OUTPUT)
+    raise SystemExit(0)
 
-reset_line1 = f"↺ Reset Diario : {d_reset_time} ({d_reset_in})"
-reset_line2 = f"↺ Reset Semanal: {w_reset_time} ({w_reset_in})"
+health = stats.get('health', 0)
+status = stats.get('status', 'CAIDO')
+status_lbl, status_clr = status_text(status)
 
-draw.text((12, y), reset_line1, font=fnt_reset, fill=BLUE)
-y += 20
-draw.text((12, y), reset_line2, font=fnt_reset, fill=BLUE)
+# Donut de salud a la izquierda
+R = 42
+cx_donut = 60
+cy_donut = 55
+draw_donut(img, cx_donut, cy_donut, R, health, 'SALUD', 'score', health_color(health))
+
+# Panel derecho con detalles
+px = 125
+py = 18
+
+# Estado general
+text_left(draw, 'Estado:', px, py, fnt_reg_10, BLUE)
+text_left(draw, status_lbl, px + 48, py, fnt_bold_11, status_clr)
+py += 18
+
+# Checks individuales
+draw_check(draw, px, py, stats.get('server_up', False), fnt_reg_10, f"Ollama ({fmt_ms(stats.get('server_latency_ms', 0))})")
+py += 15
+
+draw_check(draw, px, py, stats.get('cloud_reachable', False), fnt_reg_10, f"Cloud TCP ({fmt_ms(stats.get('cloud_tcp_ms', 0))})")
+py += 15
+
+draw_check(draw, px, py, stats.get('cloud_ok', False), fnt_reg_10, f"Inference ({fmt_ms(stats.get('cloud_latency_ms', 0))})")
+py += 15
+
+# Modelos cloud
+n_models = stats.get('cloud_model_count', 0)
+text_left(draw, f'Modelos cloud: {n_models}', px, py, fnt_reg_10, WHITE if n_models else GREY)
+py += 15
+
+# Cargados en memoria
+n_loaded = stats.get('loaded_count', 0)
+clr_loaded = ORANGE if n_loaded > 0 else GREY
+text_left(draw, f'En memoria: {n_loaded}', px, py, fnt_reg_10, clr_loaded)
+py += 15
+
+# TPS si hay inference ok
+tps = stats.get('cloud_tps', 0)
+if tps > 0:
+    text_left(draw, f'Cloud TPS: {tps}', px, py, fnt_reg_10, GREEN)
+    py += 15
+
+# Separador
+sep_y = cy_donut + R + 16
+draw.line([(8, sep_y), (W - 8, sep_y)], fill=DIVIDER, width=1)
+
+# Modelo activo abajo
+py = sep_y + 8
+active = stats.get('active_model', '')
+if active:
+    # Truncar nombre si es muy largo
+    short = active if len(active) <= 28 else active[:25] + '...'
+    text_left(draw, 'Modelo:', 12, py, fnt_reg_9, BLUE)
+    text_left(draw, short, 56, py, fnt_reg_9, WHITE)
+    py += 14
+
+# Modelos cloud listados
+models = stats.get('cloud_models', [])
+for mname in models[:3]:
+    short = mname if len(mname) <= 32 else mname[:29] + '...'
+    text_left(draw, f'  {short}', 12, py, fnt_reg_8, GREY)
+    py += 12
+
+# Timestamp + age
+age = stats.get('_age_s', 0)
+age_str = f'hace {age}s' if age < 60 else f'hace {age//60}m'
+ts = stats.get('timestamp', '')
+text_left(draw, f'{ts} ({age_str})', W - 110, H - 14, fnt_reg_8, GREY)
 
 tmp = OUTPUT + '.tmp'
 img.save(tmp, format='PNG')

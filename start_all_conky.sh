@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Unified Conky startup script for all instances
-# Manages: rpi1-4, copilot, khazaddum, ollama, lmstudio, etc.
+# Manages: rpi1-4, khazaddum, ollama-cloud, lmstudio, etc.
 # Includes lockfile, dynamic display detection, watchdog and dependency checks
 
 LOCKFILE="/tmp/start_all_conky.lock"
@@ -50,17 +50,24 @@ echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-def
 touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat 2>/dev/null || true
 
 # Start Hailo stats daemon (feeds get_hailo_val.sh cache)
-pkill -f 'fetch_hailo_stats.sh' 2>/dev/null || true
+pkill -f 'fetch_hailo_stats\.sh' 2>/dev/null || true
 if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ]; then
     setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
     echo "[$(date '+%H:%M:%S')] Started Hailo stats daemon"
 fi
 
 # Start LM Studio stats daemon (feeds lmstudio_render.py cache)
-pkill -f 'fetch_lmstudio_stats.py' 2>/dev/null || true
+pkill -f 'fetch_lmstudio_stats\.py' 2>/dev/null || true
 if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ]; then
     setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
     echo "[$(date '+%H:%M:%S')] Started LM Studio stats daemon"
+fi
+
+# Start Ollama Cloud stats daemon (feeds ollama_pie_gen.py)
+pkill -f 'fetch_ollama_cloud_stats\.py' 2>/dev/null || true
+if [ -x "$CONKY_DIR/fetch_ollama_cloud_stats.py" ]; then
+    setsid "$CONKY_DIR/fetch_ollama_cloud_stats.py" >> "$LOG_DIR/conky_ollama_daemon.log" 2>&1 &
+    echo "[$(date '+%H:%M:%S')] Started Ollama Cloud stats daemon"
 fi
 
 # ==============================================================================
@@ -74,9 +81,7 @@ fi
 # ==============================================================================
 
 echo "[$(date '+%H:%M:%S')] Cleaning up old Conky instances..."
-for pid in $(pgrep -x conky || true); do
-    kill -9 "$pid" 2>/dev/null || true
-done
+killall -9 conky 2>/dev/null || true
 sleep 1
 
 # ==============================================================================
@@ -89,7 +94,6 @@ declare -A CONKY_INSTANCES=(
     [rpi2]="$CONKY_DIR/conky_rpi2.conf"
     [rpi4]="$CONKY_DIR/conky_rpi4.conf"
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
-    [copilot]="$CONKY_DIR/conky_copilot.conf"
     [ollama]="$CONKY_DIR/conky_ollama.conf"
     [lmstudio]="$CONKY_DIR/conky_lmstudio.conf"
 )
@@ -130,19 +134,31 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
             break
         fi
 
-        # Ensure helper daemons are running
-        if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ] && ! pgrep -f "fetch_hailo_stats.sh" > /dev/null 2>&1; then
+        # Ensure helper daemons are running (use pgrep -f: killall fails for python3 scripts)
+        if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ] && ! pgrep -f 'fetch_hailo_stats\.sh' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
         fi
-        if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ] && ! pgrep -f "fetch_lmstudio_stats.py" > /dev/null 2>&1; then
+        if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ] && ! pgrep -f 'fetch_lmstudio_stats\.py' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
+        fi
+        if [ -x "$CONKY_DIR/fetch_ollama_cloud_stats.py" ] && ! pgrep -f 'fetch_ollama_cloud_stats\.py' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/fetch_ollama_cloud_stats.py" >> "$LOG_DIR/conky_ollama_daemon.log" 2>&1 &
         fi
 
         for name in "${!CONKY_INSTANCES[@]}"; do
             conf="${CONKY_INSTANCES[$name]}"
             log="$LOG_DIR/conky_${name}.log"
             
-            if ! pgrep -f "$conf" > /dev/null 2>&1; then
+            # Check if this conky instance is alive by its config path in /proc
+            conf_esc=$(echo "$conf" | sed 's/[][]/\\&/g')
+            found=0
+            for pdir in /proc/[0-9]*/cmdline; do
+                if grep -qa "$conf_esc" "$pdir" 2>/dev/null; then
+                    found=1
+                    break
+                fi
+            done
+            if [ "$found" -eq 0 ]; then
             # (khazaddum usa cooldown temporal en get_amdgpu_val.sh, no flag permanente)
                 cnt=${FAIL_COUNTS[$name]:-0}
                 if [ "$cnt" -lt 5 ]; then
