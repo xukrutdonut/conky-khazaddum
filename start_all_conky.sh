@@ -63,11 +63,11 @@ if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ]; then
     echo "[$(date '+%H:%M:%S')] Started LM Studio stats daemon"
 fi
 
-# Start Ollama Cloud stats daemon (feeds ollama_pie_gen.py)
-pkill -f 'fetch_ollama_cloud_stats\.py' 2>/dev/null || true
-if [ -x "$CONKY_DIR/fetch_ollama_cloud_stats.py" ]; then
-    setsid "$CONKY_DIR/fetch_ollama_cloud_stats.py" >> "$LOG_DIR/conky_ollama_daemon.log" 2>&1 &
-    echo "[$(date '+%H:%M:%S')] Started Ollama Cloud stats daemon"
+# Start OpenRouter stats daemon (feeds openrouter_pie_gen.py)
+pkill -f 'fetch_openrouter_stats\.py' 2>/dev/null || true
+if [ -x "$CONKY_DIR/fetch_openrouter_stats.py" ]; then
+    setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 &
+    echo "[$(date '+%H:%M:%S')] Started OpenRouter stats daemon"
 fi
 
 # Start IA Containers stats daemon (feeds containers_render.py cache)
@@ -101,7 +101,7 @@ declare -A CONKY_INSTANCES=(
     [rpi2]="$CONKY_DIR/conky_rpi2.conf"
     [rpi4]="$CONKY_DIR/conky_rpi4.conf"
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
-    [ollama]="$CONKY_DIR/conky_ollama.conf"
+    [openrouter]="$CONKY_DIR/conky_openrouter.conf"
     [lmstudio]="$CONKY_DIR/conky_lmstudio.conf"
     [containers]="$CONKY_DIR/conky_containers.conf"
 )
@@ -149,8 +149,8 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
         if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ] && ! pgrep -f 'fetch_lmstudio_stats\.py' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
         fi
-        if [ -x "$CONKY_DIR/fetch_ollama_cloud_stats.py" ] && ! pgrep -f 'fetch_ollama_cloud_stats\.py' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/fetch_ollama_cloud_stats.py" >> "$LOG_DIR/conky_ollama_daemon.log" 2>&1 &
+        if [ -x "$CONKY_DIR/fetch_openrouter_stats.py" ] && ! pgrep -f 'fetch_openrouter_stats\.py' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 &
         fi
         if [ -x "$CONKY_DIR/fetch_containers_stats.py" ] && ! pgrep -f 'fetch_containers_stats\.py' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
