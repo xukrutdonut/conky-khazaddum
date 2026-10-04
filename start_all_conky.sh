@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Unified Conky startup script for all instances
-# Manages: rpi1-4, khazaddum, ollama-cloud, lmstudio, etc.
+# Manages: rpi1-4, khazaddum, openrouter, lmstudio, etc.
 # Includes lockfile, dynamic display detection, watchdog and dependency checks
 
 LOCKFILE="/tmp/start_all_conky.lock"
