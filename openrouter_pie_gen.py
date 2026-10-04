@@ -108,14 +108,22 @@ bal = stats.get('balance')
 cred = stats.get('total_credits')
 pct_saldo = (bal / cred * 100.0) if (bal is not None and cred) else 0.0
 
+# Valores en EUR (convertidos en el daemon)
+em  = stats.get('eur_month')
+el  = stats.get('eur_limit')
+eb  = stats.get('eur_balance')
+ec  = stats.get('eur_credits')
+ew  = stats.get('eur_week')
+ed  = stats.get('eur_daily')
+
 # Donuts
 draw_donut(img, 92, 68, 40, pct_mes,
-           f'{pct_mes:.0f}%', 'LIMITE MES',
-           f'${um or 0:.2f} / ${lim or 0:.0f}',
+           f'€{em:.2f}' if em is not None else '—', 'CONSUMO MES',
+           f'{pct_mes:.0f}% de €{el:.0f}' if el else '',
            usage_color(pct_mes) if pct_mes < 100 else RED)
 draw_donut(img, 258, 68, 40, pct_saldo,
-           f'${bal:.2f}' if bal is not None else '—', 'SALDO',
-           f'de ${cred:.0f}' if cred else '',
+           f'€{eb:.2f}' if eb is not None else '—', 'SALDO',
+           f'{pct_saldo:.0f}% de €{ec:.0f}' if ec else '',
            GREEN if pct_saldo > 50 else ORANGE if pct_saldo > 20 else RED)
 
 # Sep
@@ -127,10 +135,10 @@ txt = f'{rw:,}'.replace(',', '.') if rw is not None else '—'
 text_centered(draw, txt, W // 2, 170, f_big, BLUE)
 text_centered(draw, 'PETICIONES ESTA SEMANA', W // 2, 195, f_lbl, WHITE)
 
-# Pie
+# Pie: peticiones hoy + consumo hoy / 7d (EUR)
 rt = stats.get('requests_today')
-uw = stats.get('usage_week')
-foot = f'hoy {rt if rt is not None else "—"}  ·  ${uw or 0:.2f} sem  ·  ${um or 0:.2f} mes'
+foot = (f'hoy {rt if rt is not None else "—"} req  ·  '
+        f'€{ed or 0:.2f} hoy  ·  €{ew or 0:.2f} 7d')
 text_centered(draw, foot, W // 2, 216, f_xs, GREY)
 
 tmp = OUTPUT + '.tmp'

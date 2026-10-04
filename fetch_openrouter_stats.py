@@ -22,6 +22,24 @@ POLL_INTERVAL = 60
 KEY_API     = 'https://openrouter.ai/api/v1/key'
 CREDITS_API = 'https://openrouter.ai/api/v1/credits'
 QUERY_API   = 'https://openrouter.ai/api/v1/analytics/query'
+FX_API      = 'https://api.frankfurter.app/latest?from=USD&to=EUR'
+
+FX_CACHE = {'rate': None, 'ts': 0.0}
+
+
+def fetch_fx():
+    """Tipo de cambio USD->EUR (ECB via frankfurter.app), cache 1h."""
+    now = time.time()
+    if FX_CACHE['rate'] and now - FX_CACHE['ts'] < 3600:
+        return FX_CACHE['rate']
+    try:
+        req = urllib.request.Request(FX_API, headers={'User-Agent': 'conky-openrouter/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rate = float(json.loads(r.read().decode())['rates']['EUR'])
+        FX_CACHE.update(rate=rate, ts=now)
+        return rate
+    except Exception:
+        return FX_CACHE['rate']
 
 
 def read_env(name):
@@ -103,6 +121,9 @@ def collect():
         'requests_today': None, 'requests_week': None, 'requests_month': None,
         'tokens_week': None, 'usage_week': None,
         'analytics_ok': False, 'by_model_week': [],
+        'eur_rate': None, 'eur_daily': None, 'eur_week': None,
+        'eur_month': None, 'eur_limit': None, 'eur_balance': None,
+        'eur_credits': None,
     }
     if not key:
         return stats
@@ -153,6 +174,26 @@ def collect():
             stats['error_analytics'] = f'HTTP {e.code}'
         except Exception as e:
             stats['error_analytics'] = str(e)
+
+    # 4) conversion a EUR
+    rate = fetch_fx()
+    if rate is None:
+        try:
+            with open(STATS_FILE) as f:
+                rate = json.load(f).get('eur_rate')
+        except Exception:
+            rate = None
+    stats['eur_rate'] = rate
+
+    def conv(x):
+        return round(x * rate, 4) if (rate and x is not None) else None
+
+    stats['eur_daily']   = conv(num(stats['usage_daily']) if stats['usage_daily'] is not None else None)
+    stats['eur_week']    = conv(num(stats['usage_week']) if stats['usage_week'] is not None else None)
+    stats['eur_month']   = conv(num(stats['usage_monthly']) if stats['usage_monthly'] is not None else None)
+    stats['eur_limit']   = conv(num(stats['limit']) if stats['limit'] is not None else None)
+    stats['eur_balance'] = conv(num(stats['balance']) if stats['balance'] is not None else None)
+    stats['eur_credits'] = conv(num(stats['total_credits']) if stats['total_credits'] is not None else None)
 
     return stats
 
