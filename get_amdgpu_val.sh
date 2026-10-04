@@ -144,21 +144,18 @@ case "${1:-VRAM_PERC}" in
         fi
         ;;
     GPU_POWER)
-        if [ -n "$CARD_DEV" ]; then
-            hwmon=$(ls "$CARD_DEV/hwmon/" 2>/dev/null | head -1)
-            if [ -n "$hwmon" ]; then
-                p1=$(safe_read "$CARD_DEV/hwmon/$hwmon/power1_average" 0)
-                if [ "${p1:-0}" = "0" ]; then
-                    p1=$(safe_read "$CARD_DEV/hwmon/$hwmon/power1_input" 0)
-                fi
-                p_clean=$(echo "$p1" | tr -dc '0-9')
-                awk -v p="${p_clean:-0}" 'BEGIN { printf "%.1f\n", p/1000000 }'
-            else
-                echo "0"
-            fi
-        else
-            echo "0"
-        fi
+        # DESACTIVADO 2026-10-01 (estabilidad RX480):
+        # power1_average/power1_input en hwmon de amdgpu ejecutan una lectura
+        # del registro de potencia en la SMU (AMDGpu_PP_SMU_MSG_POWER / 0x282).
+        # En Polaris via riser x4 esa lectura falla de forma intermitente y el
+        # driver registra "amdgpu: last message was failed ret is 0" en dmesg.
+        # El error en si es benigno, PERO gpu-watchdog.sh lo trataba como
+        # "fallo de enlace/anillo GPU" y tras 3 avisos lanzaba SBR (Secondary
+        # Bus Reset), que zombifica la GPU hasta un cold boot (el ATOM BIOS no
+        # puede reinicializarse tras SBR). Es decir: un dato cosmético de
+        # conky terminaba matando la GPU. Se devuelve 0 sin tocar el kernel.
+        # Para reactivar: quitar el early-exit y aceptar el riesgo del watchdog.
+        echo "0"
         ;;
     VRAM_PERC)
         if [ -n "$CARD_DEV" ]; then

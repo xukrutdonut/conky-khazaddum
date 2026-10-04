@@ -19,8 +19,8 @@ def ensure_helper(path, key):
 
 def render():
     # Asegurar scripts helper para las barras
-    ensure_helper('/tmp/conky_intel_tps.sh', 'INTEL_TPS_PCT')
-    ensure_helper('/tmp/conky_amd_tps.sh', 'AMD_TPS_PCT')
+    ensure_helper('/tmp/conky_intel_gpu.sh', 'INTEL_GPU_BUSY')
+    ensure_helper('/tmp/conky_amd_gpu.sh', 'AMD_GPU_BUSY')
 
     if not os.path.exists(DAT_FILE):
         print("${color4}${alignc}IA CONTAINERS${color}")
@@ -72,9 +72,12 @@ def render():
         else:
             print("${color5}(Sin modelos cargados)${color}")
 
-        # tok/s con barra
-        print(f"${{color1}}Velocidad: ${{color2}}{tps_txt}${{color}}")
-        print(f"${{execbar 4,344 /tmp/conky_intel_tps.sh}}")
+        # Uso real de GPU con barra
+        gpu_busy = data.get('INTEL_GPU_BUSY', '0')
+        gpu_pwr = data.get('INTEL_GPU_PWR', '0')
+        pkg_pwr = data.get('INTEL_PKG_PWR', '0')
+        print(f"${{color1}}Uso GPU: ${{color2}}{gpu_busy}%${{color}}  ${{color1}}Pwr: ${{color2}}{gpu_pwr}W${{color}}")
+        print(f"${{execbar 4,344 /tmp/conky_intel_gpu.sh}}")
 
         # Modelos disponibles
         if num_avail > 0:
@@ -97,17 +100,38 @@ def render():
         print("${color1}:1235${color}  ${color3}DETENIDO${color}")
     else:
         num_loaded = int(data.get('AMD_NUM_LOADED', '0'))
-        tps_txt = data.get('AMD_TPS_TXT', '—')
+        num_avail = int(data.get('AMD_NUM_AVAIL', '0'))
         print(f"${{color1}}:1235${{color}}  ${{color2}}RUNNING${{color}}")
         if num_loaded > 0:
             for i in range(num_loaded):
                 name = data.get(f'AMD_M{i}_NAME', '?')
+                mtype = data.get(f'AMD_M{i}_TYPE', '?')
+                quant = data.get(f'AMD_M{i}_QUANT', '?')
+                ctx = data.get(f'AMD_M{i}_CTX', '0')
                 short = name if len(name) <= 30 else name[:27] + '...'
                 print(f"${{color2}}▶ {short}${{color}}")
+                print(f"${{color1}}  Tipo: ${{color}}{mtype}  ${{color1}}Quant: ${{color2}}{quant}${{color}}  ${{color1}}Ctx: ${{color2}}{ctx}${{color}}")
         else:
             print("${color5}(Sin modelos cargados)${color}")
-        print(f"${{color1}}Velocidad: ${{color2}}{tps_txt}${{color}}")
-        print(f"${{execbar 4,344 /tmp/conky_amd_tps.sh}}")
+        # Uso real de GPU con barra
+        gpu_busy = data.get('AMD_GPU_BUSY', '0')
+        vram_used = data.get('AMD_VRAM_USED', '0')
+        vram_total = data.get('AMD_VRAM_TOTAL', '0')
+        if vram_total and int(vram_total) > 0:
+            print(f"${{color1}}Uso GPU: ${{color2}}{gpu_busy}%${{color}}  ${{color1}}VRAM: ${{color2}}{vram_used}/{vram_total} MB${{color}}")
+        else:
+            print(f"${{color1}}Uso GPU: ${{color2}}{gpu_busy}%${{color}}")
+        print(f"${{execbar 4,344 /tmp/conky_amd_gpu.sh}}")
+        # Modelos disponibles
+        if num_avail > 0:
+            avail_names = []
+            for i in range(min(num_avail, 4)):
+                aname = data.get(f'AMD_A{i}_NAME', '')
+                if aname:
+                    short = aname if len(aname) <= 20 else aname[:17] + '...'
+                    avail_names.append(short)
+            if avail_names:
+                print(f"${{color1}}Disponibles: ${{color}}{', '.join(avail_names)}${{color}}")
 
 if __name__ == '__main__':
     render()

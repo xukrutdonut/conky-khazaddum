@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Daemon que recolecta stats de los contenedores IA (Intel OpenVINO + AMD RX480).
-Escribe /tmp/conky_containers.dat para que containers_render.py lo lea."""
+Escribe /tmp/conky_containers.dat para que containers_render.py lo lea.
+
+Monitoriza uso real de GPU sin lanzar benchmarks.
+- Intel Arc: intel_gpu_top -J (RC6 idle, power, engines)
+- AMD RX480: sysfs gpu_busy_percent + mem_info_vram
+"""
 import json
 import os
 import subprocess
@@ -9,7 +14,6 @@ import socket
 
 DAT_FILE = '/tmp/conky_containers.dat'
 INTERVAL = 5          # poll cada 5s
-BENCH_INTERVAL = 30   # benchmark tok/s cada 30s
 INTEL_PORT = 8006
 AMD_PORT = 1235
 
@@ -30,7 +34,7 @@ def docker_status(name):
         )
         if r.returncode == 0 and r.stdout.strip():
             parts = r.stdout.strip().split('|')
-            status = parts[0]  # running, exited, etc.
+            status = parts[0]
             running = parts[1].lower() == 'true' if len(parts) > 1 else False
             return running, status
     except Exception:
@@ -49,20 +53,6 @@ def http_get_json(url, timeout=3):
         pass
     return None
 
-def http_post_json(url, payload, timeout=30):
-    try:
-        r = subprocess.run(
-            ['curl', '-s', '--max-time', str(timeout), '-X', 'POST',
-             '-H', 'Content-Type: application/json',
-             '-d', json.dumps(payload), url],
-            capture_output=True, text=True, timeout=timeout + 5
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return json.loads(r.stdout.strip())
-    except Exception:
-        pass
-    return None
-
 def port_open(port, timeout=1):
     try:
         with socket.create_connection(('127.0.0.1', port), timeout=timeout):
@@ -70,7 +60,86 @@ def port_open(port, timeout=1):
     except OSError:
         return False
 
-def collect_intel(last_bench_time, last_tps):
+def read_intel_gpu_stats():
+    """Lee uso real de Intel Arc via intel_gpu_top -J (streaming).
+    Lee el primer objeto JSON completo y mata el proceso.
+    Devuelve dict con gpu_busy%, gpu_power_w, pkg_power_w, render%, compute%."""
+    p = None
+    try:
+        p = subprocess.Popen(
+            ['intel_gpu_top', '-J', '-s', '1000'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        assert p.stdout is not None
+        buf = ''
+        import time as _t
+        deadline = _t.time() + 5
+        while _t.time() < deadline:
+            line = p.stdout.readline()
+            if not line:
+                break
+            buf += line
+            idx = buf.find('{')
+            if idx == -1:
+                continue
+            depth = 0
+            end = -1
+            for i, c in enumerate(buf[idx:], idx):
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            if end > 0:
+                obj = json.loads(buf[idx:end])
+                rc6 = obj.get('rc6', {}).get('value', 100)
+                gpu_busy = max(0, 100 - rc6)
+                power = obj.get('power', {})
+                engines = obj.get('engines', {})
+                render = engines.get('Render/3D', {}).get('busy', 0)
+                compute = engines.get('Compute', {}).get('busy', 0)
+                if compute == 0:
+                    for k, v in engines.items():
+                        if v.get('busy', 0) > 0 and k != 'Render/3D':
+                            compute = max(compute, v['busy'])
+                return {
+                    'gpu_busy': round(gpu_busy, 1),
+                    'gpu_power': round(power.get('GPU', 0), 2),
+                    'pkg_power': round(power.get('Package', 0), 2),
+                    'render': round(render, 1),
+                    'compute': round(compute, 1),
+                }
+    except Exception:
+        pass
+    finally:
+        if p:
+            p.kill()
+            p.wait()
+    return None
+
+def read_amd_gpu_stats():
+    """Lee uso real de AMD RX480 via sysfs."""
+    stats = {}
+    try:
+        with open('/sys/class/drm/card1/device/gpu_busy_percent') as f:
+            stats['gpu_busy'] = int(f.read().strip())
+    except Exception:
+        stats['gpu_busy'] = -1
+    try:
+        with open('/sys/class/drm/card1/device/mem_info_vram_used') as f:
+            stats['vram_used_mb'] = int(f.read().strip()) // (1024 * 1024)
+    except Exception:
+        stats['vram_used_mb'] = -1
+    try:
+        with open('/sys/class/drm/card1/device/mem_info_vram_total') as f:
+            stats['vram_total_mb'] = int(f.read().strip()) // (1024 * 1024)
+    except Exception:
+        stats['vram_total_mb'] = -1
+    return stats if stats.get('gpu_busy', -1) >= 0 else None
+
+def collect_intel():
     """Recolecta datos del contenedor Intel OpenVINO (:8006)."""
     running, status = docker_status('ia-gpu-intel-openvino')
     if not running:
@@ -79,10 +148,7 @@ def collect_intel(last_bench_time, last_tps):
             'status': status,
             'models': [],
             'gpu': None,
-            'tps': 0.0,
-            'tps_txt': '—',
-            'tps_pct': 0,
-            'last_bench': last_bench_time,
+            'gpu_usage': None,
         }
 
     health = http_get_json(f'http://127.0.0.1:{INTEL_PORT}/health')
@@ -103,24 +169,8 @@ def collect_intel(last_bench_time, last_tps):
             if entry['loaded']:
                 loaded_models.append(entry)
 
-    # Benchmark tok/s periódico
-    now = time.time()
-    tps = last_tps
-    tps_txt = f"{last_tps:.1f} tok/s" if last_tps > 0 else "—"
-    tps_pct = int(min(100, (last_tps / 50.0) * 100)) if last_tps > 0 else 0
-
-    if loaded_models and (now - last_bench_time) >= BENCH_INTERVAL:
-        model_name = loaded_models[0]['name']
-        bench = http_post_json(
-            f'http://127.0.0.1:{INTEL_PORT}/v1/admin/benchmark',
-            {'model': model_name},
-            timeout=45
-        )
-        if bench and 'tokens_per_second' in bench:
-            tps = round(bench['tokens_per_second'], 1)
-            tps_txt = f"{tps:.1f} tok/s"
-            tps_pct = int(min(100, (tps / 50.0) * 100))
-            last_bench_time = now
+    # Uso real de GPU via intel_gpu_top
+    gpu_usage = read_intel_gpu_stats()
 
     return {
         'running': True,
@@ -129,10 +179,7 @@ def collect_intel(last_bench_time, last_tps):
         'models': all_models,
         'loaded_models': loaded_models,
         'gpu': gpu_info,
-        'tps': tps,
-        'tps_txt': tps_txt,
-        'tps_pct': tps_pct,
-        'last_bench': last_bench_time,
+        'gpu_usage': gpu_usage,
     }
 
 def collect_amd():
@@ -143,27 +190,30 @@ def collect_amd():
             'running': False,
             'status': status,
             'models': [],
-            'tps_txt': '—',
-            'tps_pct': 0,
+            'gpu_usage': None,
         }
 
-    # Si está corriendo, intentar API
     models = []
     if port_open(AMD_PORT):
-        data = http_get_json(f'http://127.0.0.1:{AMD_PORT}/v1/models', timeout=3)
+        # LM Studio API nativa devuelve 'state': 'loaded'/'not-loaded'
+        data = http_get_json(f'http://127.0.0.1:{AMD_PORT}/api/v0/models', timeout=3)
         if data and 'data' in data:
             for m in data['data']:
                 models.append({
                     'name': m.get('id', '?'),
-                    'loaded': m.get('loaded', False),
+                    'loaded': m.get('state', '') == 'loaded',
+                    'type': m.get('type', '?'),
+                    'quant': m.get('quantization', '?'),
+                    'ctx': m.get('loaded_context_length', 0),
                 })
+
+    gpu_usage = read_amd_gpu_stats()
 
     return {
         'running': True,
         'status': status,
         'models': models,
-        'tps_txt': '—',  # AMD no tiene endpoint benchmark
-        'tps_pct': 0,
+        'gpu_usage': gpu_usage,
     }
 
 def build_dat(intel, amd):
@@ -189,11 +239,23 @@ def build_dat(intel, amd):
         # Modelos disponibles no cargados
         unloaded = [m for m in intel.get('models', []) if not m['loaded']]
         lines.append(f"INTEL_NUM_AVAIL:{len(unloaded)}")
-        for i, m in enumerate(unloaded[:4]):  # max 4 para no saturar
+        for i, m in enumerate(unloaded[:4]):
             lines.append(f"INTEL_A{i}_NAME:{m['name']}")
             lines.append(f"INTEL_A{i}_TYPE:{m['type']}")
-        lines.append(f"INTEL_TPS_TXT:{intel['tps_txt']}")
-        lines.append(f"INTEL_TPS_PCT:{intel['tps_pct']}")
+        # Uso real de GPU (reemplaza tok/s)
+        gu = intel.get('gpu_usage')
+        if gu:
+            lines.append(f"INTEL_GPU_BUSY:{gu['gpu_busy']}")
+            lines.append(f"INTEL_GPU_PWR:{gu['gpu_power']}")
+            lines.append(f"INTEL_PKG_PWR:{gu['pkg_power']}")
+            lines.append(f"INTEL_RENDER:{gu['render']}")
+            lines.append(f"INTEL_COMPUTE:{gu['compute']}")
+        else:
+            lines.append("INTEL_GPU_BUSY:0")
+            lines.append("INTEL_GPU_PWR:0")
+            lines.append("INTEL_PKG_PWR:0")
+            lines.append("INTEL_RENDER:0")
+            lines.append("INTEL_COMPUTE:0")
 
     # AMD
     lines.append(f"AMD_RUNNING:{1 if amd['running'] else 0}")
@@ -203,19 +265,34 @@ def build_dat(intel, amd):
         lines.append(f"AMD_NUM_LOADED:{len(loaded)}")
         for i, m in enumerate(loaded):
             lines.append(f"AMD_M{i}_NAME:{m['name']}")
-        lines.append(f"AMD_TPS_TXT:{amd['tps_txt']}")
-        lines.append(f"AMD_TPS_PCT:{amd['tps_pct']}")
+            lines.append(f"AMD_M{i}_TYPE:{m.get('type', '?')}")
+            lines.append(f"AMD_M{i}_QUANT:{m.get('quant', '?')}")
+            lines.append(f"AMD_M{i}_CTX:{m.get('ctx', 0)}")
+        # Modelos disponibles no cargados
+        unloaded = [m for m in amd['models'] if not m['loaded']]
+        lines.append(f"AMD_NUM_AVAIL:{len(unloaded)}")
+        for i, m in enumerate(unloaded[:4]):
+            lines.append(f"AMD_A{i}_NAME:{m['name']}")
+            lines.append(f"AMD_A{i}_TYPE:{m.get('type', '?')}")
+        # Uso real de GPU
+        gu = amd.get('gpu_usage')
+        if gu:
+            lines.append(f"AMD_GPU_BUSY:{gu.get('gpu_busy', 0)}")
+            vram_used = gu.get('vram_used_mb', 0)
+            vram_total = gu.get('vram_total_mb', 0)
+            lines.append(f"AMD_VRAM_USED:{vram_used}")
+            lines.append(f"AMD_VRAM_TOTAL:{vram_total}")
+        else:
+            lines.append("AMD_GPU_BUSY:0")
+            lines.append("AMD_VRAM_USED:0")
+            lines.append("AMD_VRAM_TOTAL:0")
 
     write_dat(lines)
 
 def main():
-    last_bench_time = 0.0
-    last_tps = 0.0
     while True:
         try:
-            intel = collect_intel(last_bench_time, last_tps)
-            last_bench_time = intel.get('last_bench', last_bench_time)
-            last_tps = intel.get('tps', last_tps)
+            intel = collect_intel()
             amd = collect_amd()
             build_dat(intel, amd)
         except Exception:
