@@ -49,16 +49,13 @@ def render():
         print("${color1}:8006${color}  ${color3}DETENIDO${color}")
     else:
         health = data.get('INTEL_HEALTH', '?')
-        gpu_name = data.get('INTEL_GPU_NAME', 'Intel Arc')
-        gpu_mem = data.get('INTEL_GPU_MEM', '0')
-        tps_txt = data.get('INTEL_TPS_TXT', '—')
-        tps_pct = data.get('INTEL_TPS_PCT', '0')
         num_loaded = int(data.get('INTEL_NUM_LOADED', '0'))
         num_avail = int(data.get('INTEL_NUM_AVAIL', '0'))
 
         health_color = 'color2' if health == 'ready' else 'color5'
         print(f"${{color1}}Estado: ${{{health_color}}}{health}${{color}}  ${{color1}}:8006${{color}}")
-        print(f"${{color1}}GPU: ${{color4}}{gpu_name}${{color}}  ${{color1}}VRAM: ${{color2}}{gpu_mem} MB${{color}}")
+        total_mb = sum(int(data.get(f'INTEL_M{i}_SIZE', '0')) for i in range(num_loaded))
+        print(f"${{color1}}Peso total: ${{color2}}{total_mb/1024:.1f} GB${{color}}  ${{color1}}Modelos: ${{color2}}{num_loaded}${{color}}")
 
         if num_loaded > 0:
             for i in range(num_loaded):
@@ -66,9 +63,8 @@ def render():
                 mtype = data.get(f'INTEL_M{i}_TYPE', '?')
                 size = data.get(f'INTEL_M{i}_SIZE', '0')
                 # Truncar nombre si es muy largo
-                short = name if len(name) <= 30 else name[:27] + '...'
-                print(f"${{color2}}▶ {short}${{color}}")
-                print(f"${{color1}}  Tipo: ${{color}}{mtype}  ${{color1}}Size: ${{color2}}{size} MB${{color}}")
+                short = name if len(name) <= 26 else name[:23] + '...'
+                print(f"${{color2}}▶ {short}${{color}} ${{color1}}({mtype}, {int(float(size))} MB)${{color}}")
         else:
             print("${color5}(Sin modelos cargados)${color}")
 

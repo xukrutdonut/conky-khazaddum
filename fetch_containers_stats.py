@@ -119,25 +119,57 @@ def read_intel_gpu_stats():
             p.wait()
     return None
 
+def find_amdgpu_card():
+    """Localiza el sysfs device del driver amdgpu dinámicamente
+    (la enumeración DRM no es estable entre arranques)."""
+    import glob
+    for link in sorted(glob.glob('/sys/class/drm/card*/device/driver')):
+        if os.path.basename(os.readlink(link)) == 'amdgpu':
+            return os.path.dirname(link)
+    return '/sys/class/drm/card0/device'
+
+
 def read_amd_gpu_stats():
     """Lee uso real de AMD RX480 via sysfs."""
     stats = {}
+    card = find_amdgpu_card()
     try:
-        with open('/sys/class/drm/card1/device/gpu_busy_percent') as f:
+        with open(f'{card}/gpu_busy_percent') as f:
             stats['gpu_busy'] = int(f.read().strip())
     except Exception:
         stats['gpu_busy'] = -1
     try:
-        with open('/sys/class/drm/card1/device/mem_info_vram_used') as f:
+        with open(f'{card}/mem_info_vram_used') as f:
             stats['vram_used_mb'] = int(f.read().strip()) // (1024 * 1024)
     except Exception:
         stats['vram_used_mb'] = -1
     try:
-        with open('/sys/class/drm/card1/device/mem_info_vram_total') as f:
+        with open(f'{card}/mem_info_vram_total') as f:
             stats['vram_total_mb'] = int(f.read().strip()) // (1024 * 1024)
     except Exception:
         stats['vram_total_mb'] = -1
     return stats if stats.get('gpu_busy', -1) >= 0 else None
+
+def model_disk_size_mb(name, _cache={}):
+    """Tamaño en disco (MB) de un modelo OVMS desde el volumen del host.
+    Cacheado: los ficheros no cambian mientras el contenedor corre."""
+    if name in _cache:
+        return _cache[name]
+    total = 0
+    try:
+        base = '/home/arkantu/produccion/openvino-models/.openvino-ir'
+        mdir = os.path.join(base, name)
+        if os.path.isdir(mdir):
+            for root, _dirs, files in os.walk(mdir):
+                for fn in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, fn))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    _cache[name] = total / (1024 * 1024)
+    return _cache[name]
 
 def collect_intel():
     """Recolecta datos del contenedor Intel OpenVINO (:8006)."""
@@ -151,23 +183,24 @@ def collect_intel():
             'gpu_usage': None,
         }
 
-    health = http_get_json(f'http://127.0.0.1:{INTEL_PORT}/health')
-    gpu_info = http_get_json(f'http://127.0.0.1:{INTEL_PORT}/v1/admin/gpu/status')
-    models_info = http_get_json(f'http://127.0.0.1:{INTEL_PORT}/v1/admin/models')
+    # OVMS no expone /health ni /v1/admin/*: los endpoints correctos son
+    # /v1/models y /v1/config. Todos los modelos del config se cargan de
+    # forma EAGER al arrancar el contenedor, asi que "cargado" == presente.
+    ready = port_open(INTEL_PORT)
+    config = http_get_json(f'http://127.0.0.1:{INTEL_PORT}/v1/config')
 
     loaded_models = []
     all_models = []
-    if models_info and 'models' in models_info:
-        for m in models_info['models']:
+    if isinstance(config, dict):
+        for name in config:
             entry = {
-                'name': m.get('name', '?'),
-                'type': m.get('type', '?'),
-                'loaded': m.get('loaded', False),
-                'size_mb': m.get('size_mb', 0),
+                'name': name,
+                'type': 'embeddings' if ('embed' in name.lower() or 'minilm' in name.lower()) else 'llm',
+                'loaded': True,
+                'size_mb': model_disk_size_mb(name),
             }
             all_models.append(entry)
-            if entry['loaded']:
-                loaded_models.append(entry)
+            loaded_models.append(entry)
 
     # Uso real de GPU via intel_gpu_top
     gpu_usage = read_intel_gpu_stats()
@@ -175,10 +208,10 @@ def collect_intel():
     return {
         'running': True,
         'status': status,
-        'health': health.get('status', '?') if health else '?',
+        'health': 'ready' if ready else 'starting',
         'models': all_models,
         'loaded_models': loaded_models,
-        'gpu': gpu_info,
+        'gpu': None,
         'gpu_usage': gpu_usage,
     }
 
@@ -294,6 +327,17 @@ def main():
         try:
             intel = collect_intel()
             amd = collect_amd()
+            # La inferencia en RX480 es en rafagas: muestrear gpu_busy varias
+            # veces dentro de la ventana y guardar el PICO para la barra de
+            # conky, si no la grafica casi siempre sale 0.
+            peak = read_amd_gpu_stats()
+            if peak:
+                for _ in range(9):
+                    time.sleep(INTERVAL / 10)
+                    s = read_amd_gpu_stats()
+                    if s and s.get('gpu_busy', 0) > peak.get('gpu_busy', 0):
+                        peak['gpu_busy'] = s['gpu_busy']
+                amd['gpu_usage']['gpu_busy'] = peak['gpu_busy']
             build_dat(intel, amd)
         except Exception:
             pass
