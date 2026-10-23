@@ -47,7 +47,7 @@ echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-def
 # PRE-CREATE DAEMON DATA
 # ==============================================================================
 
-touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat 2>/dev/null || true
+touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_nvme2tb_io.dat 2>/dev/null || true
 
 # Start Hailo stats daemon (feeds get_hailo_val.sh cache)
 pkill -f 'fetch_hailo_stats\.sh' 2>/dev/null || true
@@ -75,6 +75,13 @@ pkill -f 'fetch_containers_stats\.py' 2>/dev/null || true
 if [ -x "$CONKY_DIR/fetch_containers_stats.py" ]; then
     setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
     echo "[$(date '+%H:%M:%S')] Started IA Containers stats daemon"
+fi
+
+# Start NVMe 2TB I/O daemon (feeds nvme2tb_read.sh / nvme2tb_write.sh)
+pkill -f 'nvme2tb_io_daemon\.sh' 2>/dev/null || true
+if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ]; then
+    setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 &
+    echo "[$(date '+%H:%M:%S')] Started NVMe 2TB I/O daemon"
 fi
 
 # ==============================================================================
@@ -154,6 +161,10 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
         fi
         if [ -x "$CONKY_DIR/fetch_containers_stats.py" ] && ! pgrep -f 'fetch_containers_stats\.py' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
+        fi
+
+        if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ] && ! pgrep -f 'nvme2tb_io_daemon\.sh' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 &
         fi
 
         for name in "${!CONKY_INSTANCES[@]}"; do
