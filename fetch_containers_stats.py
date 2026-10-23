@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Daemon que recolecta stats de los contenedores IA (Intel OpenVINO + AMD RX480).
+"""Daemon que recolecta stats del contenedor IA Intel OpenVINO.
 Escribe /tmp/conky_containers.dat para que containers_render.py lo lea.
 
-Monitoriza uso real de GPU sin lanzar benchmarks.
-- Intel Arc: intel_gpu_top -J (RC6 idle, power, engines)
-- AMD RX480: sysfs gpu_busy_percent + mem_info_vram
+Monitoriza uso real de GPU Intel Arc sin lanzar benchmarks.
 """
 import json
 import os
@@ -15,7 +13,6 @@ import socket
 DAT_FILE = '/tmp/conky_containers.dat'
 INTERVAL = 5          # poll cada 5s
 INTEL_PORT = 8006
-AMD_PORT = 1235
 
 def write_dat(lines):
     try:
@@ -119,37 +116,6 @@ def read_intel_gpu_stats():
             p.wait()
     return None
 
-def find_amdgpu_card():
-    """Localiza el sysfs device del driver amdgpu dinámicamente
-    (la enumeración DRM no es estable entre arranques)."""
-    import glob
-    for link in sorted(glob.glob('/sys/class/drm/card*/device/driver')):
-        if os.path.basename(os.readlink(link)) == 'amdgpu':
-            return os.path.dirname(link)
-    return '/sys/class/drm/card0/device'
-
-
-def read_amd_gpu_stats():
-    """Lee uso real de AMD RX480 via sysfs."""
-    stats = {}
-    card = find_amdgpu_card()
-    try:
-        with open(f'{card}/gpu_busy_percent') as f:
-            stats['gpu_busy'] = int(f.read().strip())
-    except Exception:
-        stats['gpu_busy'] = -1
-    try:
-        with open(f'{card}/mem_info_vram_used') as f:
-            stats['vram_used_mb'] = int(f.read().strip()) // (1024 * 1024)
-    except Exception:
-        stats['vram_used_mb'] = -1
-    try:
-        with open(f'{card}/mem_info_vram_total') as f:
-            stats['vram_total_mb'] = int(f.read().strip()) // (1024 * 1024)
-    except Exception:
-        stats['vram_total_mb'] = -1
-    return stats if stats.get('gpu_busy', -1) >= 0 else None
-
 def model_disk_size_mb(name, _cache={}):
     """Tamaño en disco (MB) de un modelo OVMS desde el volumen del host.
     Cacheado: los ficheros no cambian mientras el contenedor corre."""
@@ -215,41 +181,7 @@ def collect_intel():
         'gpu_usage': gpu_usage,
     }
 
-def collect_amd():
-    """Recolecta datos del contenedor AMD RX480 (:1235)."""
-    running, status = docker_status('ia-gpu-amd-rx480')
-    if not running:
-        return {
-            'running': False,
-            'status': status,
-            'models': [],
-            'gpu_usage': None,
-        }
-
-    models = []
-    if port_open(AMD_PORT):
-        # LM Studio API nativa devuelve 'state': 'loaded'/'not-loaded'
-        data = http_get_json(f'http://127.0.0.1:{AMD_PORT}/api/v0/models', timeout=3)
-        if data and 'data' in data:
-            for m in data['data']:
-                models.append({
-                    'name': m.get('id', '?'),
-                    'loaded': m.get('state', '') == 'loaded',
-                    'type': m.get('type', '?'),
-                    'quant': m.get('quantization', '?'),
-                    'ctx': m.get('loaded_context_length', 0),
-                })
-
-    gpu_usage = read_amd_gpu_stats()
-
-    return {
-        'running': True,
-        'status': status,
-        'models': models,
-        'gpu_usage': gpu_usage,
-    }
-
-def build_dat(intel, amd):
+def build_dat(intel):
     lines = []
     # Intel
     lines.append(f"INTEL_RUNNING:{1 if intel['running'] else 0}")
@@ -290,55 +222,13 @@ def build_dat(intel, amd):
             lines.append("INTEL_RENDER:0")
             lines.append("INTEL_COMPUTE:0")
 
-    # AMD
-    lines.append(f"AMD_RUNNING:{1 if amd['running'] else 0}")
-    lines.append(f"AMD_STATUS:{amd['status']}")
-    if amd['running']:
-        loaded = [m for m in amd['models'] if m['loaded']]
-        lines.append(f"AMD_NUM_LOADED:{len(loaded)}")
-        for i, m in enumerate(loaded):
-            lines.append(f"AMD_M{i}_NAME:{m['name']}")
-            lines.append(f"AMD_M{i}_TYPE:{m.get('type', '?')}")
-            lines.append(f"AMD_M{i}_QUANT:{m.get('quant', '?')}")
-            lines.append(f"AMD_M{i}_CTX:{m.get('ctx', 0)}")
-        # Modelos disponibles no cargados
-        unloaded = [m for m in amd['models'] if not m['loaded']]
-        lines.append(f"AMD_NUM_AVAIL:{len(unloaded)}")
-        for i, m in enumerate(unloaded[:4]):
-            lines.append(f"AMD_A{i}_NAME:{m['name']}")
-            lines.append(f"AMD_A{i}_TYPE:{m.get('type', '?')}")
-        # Uso real de GPU
-        gu = amd.get('gpu_usage')
-        if gu:
-            lines.append(f"AMD_GPU_BUSY:{gu.get('gpu_busy', 0)}")
-            vram_used = gu.get('vram_used_mb', 0)
-            vram_total = gu.get('vram_total_mb', 0)
-            lines.append(f"AMD_VRAM_USED:{vram_used}")
-            lines.append(f"AMD_VRAM_TOTAL:{vram_total}")
-        else:
-            lines.append("AMD_GPU_BUSY:0")
-            lines.append("AMD_VRAM_USED:0")
-            lines.append("AMD_VRAM_TOTAL:0")
-
     write_dat(lines)
 
 def main():
     while True:
         try:
             intel = collect_intel()
-            amd = collect_amd()
-            # La inferencia en RX480 es en rafagas: muestrear gpu_busy varias
-            # veces dentro de la ventana y guardar el PICO para la barra de
-            # conky, si no la grafica casi siempre sale 0.
-            peak = read_amd_gpu_stats()
-            if peak:
-                for _ in range(9):
-                    time.sleep(INTERVAL / 10)
-                    s = read_amd_gpu_stats()
-                    if s and s.get('gpu_busy', 0) > peak.get('gpu_busy', 0):
-                        peak['gpu_busy'] = s['gpu_busy']
-                amd['gpu_usage']['gpu_busy'] = peak['gpu_busy']
-            build_dat(intel, amd)
+            build_dat(intel)
         except Exception:
             pass
         time.sleep(INTERVAL)
