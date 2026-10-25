@@ -157,7 +157,7 @@ for _card in /sys/class/drm/card*/device; do
     fi
 done
 
-# --- Hailo PCIe ---
+# --- Hailo PCIe + telemetría real del servicio OCR ---
 HAILO_STATE="no-detectado"; HAILO_SLOT="N/A"; HAILO_POWER="N/A"; HAILO_TEMP="0"; HAILO_UTIL="0"
 for _pf in /sys/bus/pci/devices/*/; do
     if [ -f "${_pf}uevent" ] && grep -qi "1e60" "${_pf}uevent" 2>/dev/null; then
@@ -177,6 +177,12 @@ if [[ "$HAILO_STATE" == "no-detectado" && -e /dev/hailo0 ]]; then
     HAILO_STATE="activo"
     HAILO_SLOT="hailo0"
     HAILO_POWER="D0"
+fi
+# El servicio calcula busy_ms_last60s con las inferencias Hailo completadas.
+# Redondeo hacia arriba: inferencias cortas (<0.5% del minuto) no deben parecer 0%.
+_HAILO_METRICS=$(curl -fsS --max-time 2 http://127.0.0.1:8089/metrics 2>/dev/null || true)
+if [[ -n "$_HAILO_METRICS" ]]; then
+    HAILO_UTIL=$(python3 -c 'import json,sys; m=json.load(sys.stdin); b=max(0,int(m.get("busy_ms_last60s",0))); print(min(100,(b+599)//600) if m.get("hailo_available") and m.get("engine")=="hailo" and b else 0)' <<< "$_HAILO_METRICS" 2>/dev/null || echo "0")
 fi
 
 # --- Salida ---
