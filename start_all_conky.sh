@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Unified Conky startup script for all instances
-# Manages: rpi1-4, khazaddum, openrouter, lmstudio, etc.
+# Manages: rpi1-4, khazaddum, openrouter, containers, etc.
 # Includes lockfile, dynamic display detection, watchdog and dependency checks
 
 LOCKFILE="/tmp/start_all_conky.lock"
@@ -56,12 +56,7 @@ if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ]; then
     echo "[$(date '+%H:%M:%S')] Started Hailo stats daemon"
 fi
 
-# Start LM Studio stats daemon (feeds lmstudio_render.py cache)
-pkill -f 'fetch_lmstudio_stats\.py' 2>/dev/null || true
-if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ]; then
-    setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
-    echo "[$(date '+%H:%M:%S')] Started LM Studio stats daemon"
-fi
+# Stats daemon de contenedores IA (OpenVINO :8006 + LM Studio :1234)
 
 # Start OpenRouter stats daemon (feeds openrouter_pie_gen.py)
 pkill -f 'fetch_openrouter_stats\.py' 2>/dev/null || true
@@ -109,7 +104,6 @@ declare -A CONKY_INSTANCES=(
     [rpi4]="$CONKY_DIR/conky_rpi4.conf"
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [openrouter]="$CONKY_DIR/conky_openrouter.conf"
-    [lmstudio]="$CONKY_DIR/conky_lmstudio.conf"
     [containers]="$CONKY_DIR/conky_containers.conf"
 )
 
@@ -151,9 +145,6 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
         # Ensure helper daemons are running (use pgrep -f: killall fails for python3 scripts)
         if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ] && ! pgrep -f 'fetch_hailo_stats\.sh' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
-        fi
-        if [ -x "$CONKY_DIR/fetch_lmstudio_stats.py" ] && ! pgrep -f 'fetch_lmstudio_stats\.py' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/fetch_lmstudio_stats.py" >> "$LOG_DIR/conky_lmstudio_daemon.log" 2>&1 &
         fi
         if [ -x "$CONKY_DIR/fetch_openrouter_stats.py" ] && ! pgrep -f 'fetch_openrouter_stats\.py' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 &
