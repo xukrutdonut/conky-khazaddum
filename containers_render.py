@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Render para Conky: estado de los motores de inferencia locales
-(contenedor OpenVINO de Intel + servidor Intel de LM Studio)."""
+(contenedor OpenVINO de Intel + llama.cpp Vulkan del Pi5 .80)."""
 import os
 
 DAT_FILE = '/tmp/conky_containers.dat'
@@ -23,7 +23,6 @@ def bar(path):
 
 def render():
     write_helper('/tmp/conky_intel_gpu.sh', 'INTEL_GPU_BUSY')
-    write_helper('/tmp/conky_lm_gpu.sh', 'LM_GPU_BUSY')
 
     if not os.path.exists(DAT_FILE):
         print("${color4}${alignc}IA GPU${color}")
@@ -78,42 +77,41 @@ def render():
             if names:
                 print(f"${{color1}}Disponibles: ${{color}}{', '.join(names)}${{color}}")
 
-    # ══════════ LM Studio ══════════
+    # ══════════ Pi5 .80 — llama.cpp Vulkan ══════════
     print()
-    print("${color4}── LM Studio — Vulkan GGML ──${color}")
-    if data.get('LM_RUNNING', '0') != '1':
-        print("${color3}Estado: APAGADO${color}")
-        print("${color1}:1234${color}  ${color3}servidor parado${color}")
-        print("${color5}arráncalo con: lms server start${color}")
+    print("${color4}── Pi5 .80 — llama.cpp Vulkan ──${color}")
+    running = data.get('RPI_RUNNING', '0') == '1'
+    state = data.get('RPI_STATE', '?')
+    sc = 'color2' if running else 'color3'
+    print(f"${{color1}}Estado: ${{{sc}}}{state}${{color}}  ${{color1}}:1235${{color}}")
+    gpu_on = data.get('RPI_GPU_DRIVER', '') == 'amdgpu'
+    write_helper('/tmp/conky_rpi5_bar.sh', 'RPI_GPU_BUSY' if gpu_on else 'RPI_KV')
+    if not running:
+        http = data.get('RPI_HTTP', '000')
+        detail = 'proceso caído' if http == '000' else f'HTTP {http}'
+        print(f"${{color1}}Nodo: ${{color5}}192.168.0.80${{color}}  ${{color3}}{detail}${{color}}")
+        if not gpu_on:
+            print("${color5}GPU: sin amdgpu (llvmpipe/V3D)${color}")
     else:
-        srv = data.get('LM_SERVER', '0') == '1'
-        app = data.get('LM_APP', '0') == '1'
-        state = 'ready' if srv else ('app abierta, servidor off' if app else '?')
-        sc = 'color2' if srv else 'color5'
-        print(f"${{color1}}Estado: ${{{sc}}}{state}${{color}}  ${{color1}}:1234${{color}}")
-        n_total = int(data.get('LM_NUM_TOTAL', '0'))
-        n_load = int(data.get('LM_NUM_LOADED', '0'))
-        disk = data.get('LM_DISK', '0')
-        print(f"${{color1}}Modelos: ${{color2}}{n_load}/{n_total}${{color}}  ${{color1}}Disco: ${{color2}}{disk} GB${{color}}")
-        if n_load:
-            for i in range(min(n_load, 3)):
-                name = data.get(f'LM_M{i}_NAME', '?')
-                ctx = data.get(f'LM_M{i}_CTX', '0')
-                quant = data.get(f'LM_M{i}_QUANT', '-')
-                size = int(float(data.get(f'LM_M{i}_SIZE', '0')))
-                short = name if len(name) <= 28 else name[:25] + '...'
-                print(f"${{color2}}▶ {short}${{color}} ${{color1}}({size} MB)${{color}}")
-                print(f"${{color1}}  Ctx: ${{color2}}{ctx}${{color}}  ${{color1}}Quant: ${{color2}}{quant}${{color}}")
+        model = data.get('RPI_MODEL', '?')
+        quant = data.get('RPI_QUANT', '-')
+        ctx = data.get('RPI_CTX', '0')
+        short = model if len(model) <= 30 else model[:27] + '...'
+        print(f"${{color2}}▶ {short}${{color}} ${{color1}}({quant}, ctx {ctx})${{color}}")
+        print(f"${{color1}}Slots: ${{color2}}{data.get('RPI_SLOTS', '0/0')}${{color}}  "
+              f"${{color1}}KV: ${{color2}}{data.get('RPI_KV', '0')}%${{color}}")
+        if data.get('RPI_METRICS', '0') == '1':
+            print(f"${{color1}}Gen: ${{color2}}{data.get('RPI_TPS', '0')} t/s${{color}}  "
+                  f"${{color1}}Prompt: ${{color2}}{data.get('RPI_PPS', '0')} t/s${{color}}")
+            print(f"${{color1}}Peticiones: ${{color2}}{data.get('RPI_PROC', '0')}${{color}} ${{color1}}en curso, "
+                  f"${{color}}{data.get('RPI_DEFER', '0')}${{color}} ${{color1}}en cola${{color}}")
+        if gpu_on:
+            print(f"${{color1}}GPU RX 480: ${{color2}}{data.get('RPI_GPU_BUSY', '0')}%${{color}}  "
+                  f"${{color1}}Temp: ${{color2}}{data.get('RPI_GPU_TEMP', '0')}°C${{color}}")
+            print(bar('/tmp/conky_rpi5_bar.sh'))
         else:
-            print("${color5}(Sin modelos cargados)${color}")
-        gu = data.get('LM_GPU_BUSY', '0')
-        gp = data.get('LM_GPU_PWR', '0')
-        print(f"${{color1}}Uso GPU: ${{color2}}{gu}%${{color}}  ${{color1}}Pwr: ${{color2}}{gp}W${{color}}")
-        print(bar('/tmp/conky_lm_gpu.sh'))
-        n_idle = int(data.get('LM_NUM_IDLE', '0'))
-        if n_idle:
-            print(f"${{color1}}En disco sin cargar: ${{color}}{n_idle}${{color}}")
-
+            print("${color5}GPU: amdgpu ausente (llvmpipe)${color}")
+            print(bar('/tmp/conky_rpi5_bar.sh'))
 
 if __name__ == '__main__':
     render()

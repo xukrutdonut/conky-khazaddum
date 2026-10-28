@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Daemon que recolecta stats de los servicios IA locales:
   - Intel OpenVINO Model Server (contenedor ia-gpu-intel-openvino, :8006)
-  - LM Studio (app nativa, servidor REST :1234, backend Vulkan sobre la Arc)
+  - llama.cpp Vulkan del nodo Pi5 .80 (:1235, RX 480 por PCIe)
 Escribe /tmp/conky_containers.dat para que containers_render.py lo lea.
 
 Monitoriza uso real de GPU sin lanzar benchmarks:
@@ -19,7 +19,12 @@ import time
 DAT_FILE = '/tmp/conky_containers.dat'
 INTERVAL = 5          # poll cada 5s
 INTEL_PORT = 8006
-LMSTUDIO_PORT = 1234
+# Nodo Pi5 .80: llama.cpp Vulkan (RX 480 por PCIe) sirviendo en :1235
+RPI5_HOST = '192.168.0.80'
+RPI5_PORT = 1235
+RPI5_BASE = f'http://{RPI5_HOST}:{RPI5_PORT}'
+_rpi5_prev = {'t': 0.0, 'pred': 0.0, 'prompt': 0.0}
+_rpi5_gpu_cache = {'t': 0.0, 'val': None}
 
 
 def write_dat(lines):
@@ -214,99 +219,135 @@ def collect_intel(gpu=None):
     }
 
 
-# ---------------------------------------------------------------- LM Studio --
-def quant_from_display(display):
-    """LM Studio no siempre rellena quantization.name; el nombre visible
-    incluye la cuantizacion tipo 'Qwen3 0.6B Q4 K M Vulkan (...)'."""
-    m = re.search(r'\b(I?Q\d[A-Z0-9]*(?:_[A-Z0-9]+)*)\b', display)
-    if not m:
-        return ''
-    parts = display[m.start():].split(' ')
-    tokens = []
-    for tok in parts:
-        if re.fullmatch(r'I?Q\d[A-Z0-9]*|K|_?[SML]|S|M|L', tok.strip()):
-            tokens.append(tok.strip())
-        else:
-            break
-    return '_'.join(tokens) if tokens else m.group(1)
-
-
-def lmstudio_pids():
-    """PIDs del servicio LM Studio (scan de /proc, sin llamar a la CLI `lms`,
-    que arrancaria el servicio como efecto colateral)."""
-    pids = []
-    for entry in glob.glob('/proc/[0-9]*'):
-        try:
-            with open(os.path.join(entry, 'cmdline'), 'rb') as f:
-                cmd = f.read().lower()
-        except OSError:
-            continue
-        if b'lm-studio' in cmd or b'lmstudio' in cmd:
-            pids.append(int(os.path.basename(entry)))
-    return pids
-
-
-def _rss_mb(pid):
+# -------------------------------------------------- nodo Pi5 .80 (:1235) --
+def http_status(url, timeout=3):
+    """Codigo HTTP de un endpoint (000 = sin respuesta)."""
     try:
-        with open(f'/proc/{pid}/status') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    return int(line.split()[1]) / 1024
-    except OSError:
+        r = subprocess.run(
+            ['curl', '-s', '-o', '/dev/null', '-m', str(timeout), '-w', '%{http_code}', url],
+            capture_output=True, text=True, timeout=timeout + 2
+        )
+        return r.stdout.strip() or '000'
+    except Exception:
+        return '000'
+
+
+def http_get_text(url, timeout=3):
+    try:
+        r = subprocess.run(
+            ['curl', '-s', '--max-time', str(timeout), url],
+            capture_output=True, text=True, timeout=timeout + 2
+        )
+        if r.returncode == 0:
+            return r.stdout
+    except Exception:
         pass
-    return 0.0
+    return ''
 
 
-def collect_lmstudio(gpu=None):
-    """Recolecta datos de LM Studio: app nativa + servidor REST :1234.
-    Los modelos se cargan en el propio proceso (llama.cpp Vulkan sobre la Arc),
-    asi que el RSS del proceso equivale a la memoria de modelo en GTT."""
-    pids = lmstudio_pids()
-    server_up = port_open(LMSTUDIO_PORT)
-    data = http_get_json(f'http://127.0.0.1:{LMSTUDIO_PORT}/api/v1/models') if server_up else None
-    if not data or 'models' not in data:
-        # fallback API v0 (LM Studio < 0.3.6)
-        data = http_get_json(f'http://127.0.0.1:{LMSTUDIO_PORT}/api/v0/models') if server_up else None
-        if data and 'data' in data:
-            data = {'models': [
-                {
-                    'key': m.get('id', '?'),
-                    'type': m.get('type', 'llm'),
-                    'size_bytes': 0,
-                    'quantization': m.get('quantization'),
-                    'loaded_instances': [{}] if m.get('state') == 'loaded' else [],
-                } for m in data['data']
-            ]}
+def parse_metrics(text):
+    """Parser minimo de /metrics (formato Prometheus) -> {nombre: valor}."""
+    vals = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.rsplit(' ', 1)
+        if len(parts) != 2:
+            continue
+        try:
+            vals[parts[0]] = float(parts[1])
+        except ValueError:
+            continue
+    return vals
 
-    models = []
-    if data:
-        for m in data.get('models', []):
-            inst = m.get('loaded_instances') or []
-            cfg = (inst[0] or {}).get('config', {}) if inst else {}
-            quant = ((m.get('quantization') or {}).get('name')
-                     or quant_from_display(m.get('display_name') or ''))
-            models.append({
-                'name': m.get('key') or m.get('id') or '?',
-                'display': m.get('display_name') or m.get('key', '?'),
-                'type': m.get('type', 'llm'),
-                'loaded': bool(inst),
-                'size_mb': (m.get('size_bytes') or 0) / (1024 * 1024),
-                'quant': quant or '?',
-                'ctx': cfg.get('context_length') or 0,
-                'arch': m.get('architecture') or '',
-            })
+
+def rpi5_gpu():
+    """GPU AMD del nodo .80 (amdgpu) leida por SSH y cacheada 60s.
+    Sin amdgpu la imagen Vulkan cae a llvmpipe y el panel debe decirlo."""
+    now = time.time()
+    if _rpi5_gpu_cache['val'] is not None and now - _rpi5_gpu_cache['t'] < 60:
+        return _rpi5_gpu_cache['val']
+    val = {'driver': '', 'busy': 0, 'temp': 0}
+    cmd = (
+        'for d in /sys/class/drm/card*/device; do '
+        'drv=$(grep -m1 "^DRIVER=" $d/uevent 2>/dev/null | cut -d= -f2); '
+        'if [ "$drv" = "amdgpu" ]; then '
+        'busy=$(cat $d/gpu_busy_percent 2>/dev/null); '
+        'tmp=$(cat $d/hwmon/hwmon*/temp1_input 2>/dev/null | head -1); '
+        'echo "$drv|${busy:-0}|${tmp:-0}"; exit 0; fi; done; echo "none|0|0"'
+    )
+    try:
+        r = subprocess.run(
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3',
+             'arkantu@' + RPI5_HOST, cmd],
+            capture_output=True, text=True, timeout=10
+        )
+        out = (r.stdout or '').strip().splitlines()
+        if out:
+            parts = out[-1].split('|')
+            val['driver'] = parts[0]
+            val['busy'] = int(float(parts[1] or 0)) if len(parts) > 1 else 0
+            temp = int(float(parts[2] or 0)) if len(parts) > 2 else 0
+            val['temp'] = round(temp / 1000.0) if temp > 1000 else temp
+    except Exception:
+        pass
+    _rpi5_gpu_cache.update({'t': now, 'val': val})
+    return val
+
+
+def collect_rpi5():
+    """Estado del servidor llama.cpp del Pi5 .80 (Vulkan, RX 480) via HTTP."""
+    code = http_status(RPI5_BASE + '/health')
+    state = {'200': 'listo', '503': 'cargando', '000': 'sin respuesta'}.get(code, 'http ' + code)
+    props = http_get_json(RPI5_BASE + '/props') if code == '200' else None
+    slots = http_get_json(RPI5_BASE + '/slots') if code == '200' else None
+    met = parse_metrics(http_get_text(RPI5_BASE + '/metrics')) if code == '200' else {}
+
+    alias = (props or {}).get('model_alias') or ''
+    if not alias:
+        path = (props or {}).get('model_path') or ''
+        alias = os.path.basename(path.rstrip('/')) if path else '?'
+    params = ((props or {}).get('default_generation_settings') or {}).get('params') or {}
+    n_ctx = params.get('n_ctx') or (props or {}).get('n_ctx') or 0
+
+    total_slots = (props or {}).get('total_slots') or (len(slots) if isinstance(slots, list) else 0)
+    busy_slots = sum(1 for s in (slots or []) if isinstance(s, dict) and s.get('is_processing'))
+
+    now = time.time()
+    pred = met.get('llamacpp:tokens_predicted_total', 0.0)
+    prompt = met.get('llamacpp:prompt_tokens_total', 0.0)
+    tps = pps = 0.0
+    prev = _rpi5_prev
+    if prev['t'] and now > prev['t'] and pred >= prev['pred']:
+        dt = now - prev['t']
+        tps = (pred - prev['pred']) / dt
+        pps = (prompt - prev['prompt']) / dt
+    if code == '200' and met:
+        _rpi5_prev.update({'t': now, 'pred': pred, 'prompt': prompt})
+    else:
+        _rpi5_prev.update({'t': 0.0, 'pred': 0.0, 'prompt': 0.0})
 
     return {
-        'running': bool(pids) or server_up,
-        'app': bool(pids),
-        'server': server_up,
-        'models': models,
-        'rss_mb': sum(_rss_mb(p) for p in pids),
-        'gpu_usage': gpu,
+        'state': state,
+        'running': code == '200',
+        'http': code,
+        'model': alias,
+        'quant': (props or {}).get('model_ftype') or '?',
+        'ctx': n_ctx,
+        'slots_total': total_slots,
+        'slots_busy': busy_slots,
+        'tps': tps,
+        'pps': pps,
+        'kv': met.get('llamacpp:kv_cache_usage_ratio', 0.0) * 100,
+        'processing': int(met.get('llamacpp:requests_processing', 0)),
+        'deferred': int(met.get('llamacpp:requests_deferred', 0)),
+        'gpu': rpi5_gpu(),
+        'metrics': bool(met),
     }
 
 
-def build_dat(intel, lm):
+def build_dat(intel, rpi5):
     lines = []
     # ---- Intel OpenVINO
     lines.append(f"INTEL_RUNNING:{1 if intel['running'] else 0}")
@@ -333,28 +374,24 @@ def build_dat(intel, lm):
         lines.append(f"INTEL_RENDER:{int(gu.get('render', 0))}")
         lines.append(f"INTEL_COMPUTE:{int(gu.get('compute', 0))}")
 
-    # ---- LM Studio
-    lines.append(f"LM_RUNNING:{1 if lm['running'] else 0}")
-    lines.append(f"LM_APP:{1 if lm.get('app') else 0}")
-    lines.append(f"LM_SERVER:{1 if lm.get('server') else 0}")
-    lines.append(f"LM_RSS:{lm.get('rss_mb', 0):.0f}")
-    models = lm.get('models', [])
-    loaded = [m for m in models if m['loaded']]
-    lines.append(f"LM_NUM_TOTAL:{len(models)}")
-    lines.append(f"LM_NUM_LOADED:{len(loaded)}")
-    lines.append(f"LM_DISK:{sum(m['size_mb'] for m in models) / 1024:.1f}")
-    for i, m in enumerate(loaded[:3]):
-        lines.append(f"LM_M{i}_NAME:{m['name']}")
-        lines.append(f"LM_M{i}_CTX:{m['ctx']}")
-        lines.append(f"LM_M{i}_QUANT:{m['quant']}")
-        lines.append(f"LM_M{i}_SIZE:{m['size_mb']:.0f}")
-    idle = [m for m in models if not m['loaded']]
-    lines.append(f"LM_NUM_IDLE:{len(idle)}")
-    for i, m in enumerate(idle[:3]):
-        lines.append(f"LM_I{i}_NAME:{m['name']}")
-    gm = lm.get('gpu_usage') or {}
-    lines.append(f"LM_GPU_BUSY:{int(gm.get('gpu_busy', 0))}")
-    lines.append(f"LM_GPU_PWR:{gm.get('gpu_power', 0)}")
+    # ---- Pi5 .80: llama.cpp Vulkan (RX 480 por PCIe)
+    lines.append(f"RPI_STATE:{rpi5['state']}")
+    lines.append(f"RPI_RUNNING:{1 if rpi5['running'] else 0}")
+    lines.append(f"RPI_HTTP:{rpi5['http']}")
+    lines.append(f"RPI_MODEL:{rpi5['model']}")
+    lines.append(f"RPI_QUANT:{rpi5['quant']}")
+    lines.append(f"RPI_CTX:{rpi5['ctx']}")
+    lines.append(f"RPI_SLOTS:{rpi5['slots_busy']}/{rpi5['slots_total']}")
+    lines.append(f"RPI_TPS:{rpi5['tps']:.1f}")
+    lines.append(f"RPI_PPS:{rpi5['pps']:.0f}")
+    lines.append(f"RPI_KV:{rpi5['kv']:.0f}")
+    lines.append(f"RPI_PROC:{rpi5['processing']}")
+    lines.append(f"RPI_DEFER:{rpi5['deferred']}")
+    lines.append(f"RPI_METRICS:{1 if rpi5['metrics'] else 0}")
+    gpu = rpi5['gpu']
+    lines.append(f"RPI_GPU_DRIVER:{gpu['driver']}")
+    lines.append(f"RPI_GPU_BUSY:{int(gpu['busy'])}")
+    lines.append(f"RPI_GPU_TEMP:{int(gpu['temp'])}")
 
     write_dat(lines)
 
@@ -364,8 +401,8 @@ def main():
         try:
             gpu = read_intel_gpu_stats()
             intel = collect_intel(gpu)
-            lm = collect_lmstudio(gpu)
-            build_dat(intel, lm)
+            rpi5 = collect_rpi5()
+            build_dat(intel, rpi5)
         except Exception:
             pass
         time.sleep(INTERVAL)

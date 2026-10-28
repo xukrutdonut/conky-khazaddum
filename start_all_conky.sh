@@ -56,7 +56,7 @@ if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ]; then
     echo "[$(date '+%H:%M:%S')] Started Hailo stats daemon"
 fi
 
-# Stats daemon de contenedores IA (OpenVINO :8006 + LM Studio :1234)
+# Stats daemon de contenedores IA (OpenVINO :8006 + llama.cpp Pi5 .80:1235)
 
 # Start OpenRouter stats daemon (feeds openrouter_pie_gen.py)
 pkill -f 'fetch_openrouter_stats\.py' 2>/dev/null || true
