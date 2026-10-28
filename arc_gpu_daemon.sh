@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# arc_gpu_daemon.sh — Monitoriza GPU Intel usando intel_gpu_top
+# arc_gpu_daemon.sh — Monitoriza GPU Intel Arc (driver Xe) usando gputop
+# Motivo: intel_gpu_top NO soporta dispositivos Xe ("Detected Xe device which is
+# not supported by intel_gpu_top. Please use 'gputop' tool instead."), asi que el
+# panel de conky se quedaba a cero. gputop si funciona, pero necesita root para
+# leer el fdinfo de los procesos de contenedores (otros UID): regla sudoers
+# NOPASSWD en /etc/sudoers.d/gputop-monitor.
 OUTFILE="/tmp/conky_arc.dat"
 
 cleanup() {
@@ -9,82 +14,103 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT EXIT
 
-# Inicializar
 cat > "$OUTFILE" << 'INIT'
-FREQ_REQ:0
-FREQ_ACT:0
-RC6:0
-POWER:0
+FREQ:0
+GTT:0
 RNDR:0
 VIDEO:0
 COMPUTE:0
 COPY:0
 INIT
 
-python3 -u - << 'EOF'
-import subprocess, json, os
+exec python3 -u - << 'EOF'
+import os
+import re
+import subprocess
+import time
 
 OUTFILE = '/tmp/conky_arc.dat'
+ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+PCT = re.compile(r'(\d+(?:\.\d+)?)%')
+FREQ = re.compile(r'GT0-(\d+)/')
+MEM = re.compile(r'^\s*\d+\s+([\d.]+)([MG])\s')
 
-proc = subprocess.Popen(
-    ['intel_gpu_top', '-J', '-s', '2000'],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.DEVNULL,
-    text=True,
-    bufsize=1
-)
+# Respaldo de frecuencia si gputop fallara.
+FREQ_SYSFS = [
+    '/sys/class/drm/card0/device/tile0/gt0/freq0/cur_freq',
+    '/sys/class/drm/card0/gt_cur_freq_mhz',
+]
 
-buf = ""
-for line in proc.stdout:
-    buf += line
-    if line.strip().startswith('}') and buf.count('{') == buf.count('}'):
-        # Encontramos un objeto JSON completo en la raíz
+
+def sysfs_freq():
+    for p in FREQ_SYSFS:
         try:
-            # Eliminar caracteres iniciales extra como '[' o comas
-            s = buf.strip()
-            if s.startswith('['):
-                s = s[1:].strip()
-            s = s.rstrip(',')
-            
-            data = json.loads(s)
-            freq_act = data.get('frequency', {}).get('actual', 0)
-            power_gpu = data.get('power', {}).get('GPU', 0)
-            rc6 = data.get('rc6', {}).get('value', 0)
-            
-            engines = data.get('engines', {})
-            rndr = 0
-            for name, eng in engines.items():
-                if 'Render' in name or '3D' in name:
-                    rndr = max(rndr, eng.get('busy', 0))
-            
-            video = 0
-            for name, eng in engines.items():
-                if 'Video' in name:
-                    video = max(video, eng.get('busy', 0))
+            with open(p) as f:
+                return int(f.read().strip())
+        except OSError:
+            continue
+    return 0
 
-            compute = 0
-            for name, eng in engines.items():
-                if 'Compute' in name:
-                    compute = max(compute, eng.get('busy', 0))
 
-            copy = 0
-            for name, eng in engines.items():
-                if 'Blitter' in name or 'Copy' in name:
-                    copy = max(copy, eng.get('busy', 0))
+def write(freq, gtt, rndr, video, compute, copy):
+    out = (
+        f"FREQ:{freq:.0f}\n"
+        f"GTT:{gtt:.1f}\n"
+        f"RNDR:{rndr:.0f}\n"
+        f"VIDEO:{video:.0f}\n"
+        f"COMPUTE:{compute:.0f}\n"
+        f"COPY:{copy:.0f}\n"
+    )
+    tmp = OUTFILE + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write(out)
+    os.rename(tmp, OUTFILE)
 
-            out = f"""FREQ_REQ:0
-FREQ_ACT:{freq_act:.0f}
-RC6:{rc6:.0f}
-POWER:{power_gpu:.1f}
-RNDR:{rndr:.0f}
-VIDEO:{video:.0f}
-COMPUTE:{compute:.0f}
-COPY:{copy:.0f}
-"""
-            with open(OUTFILE + '.tmp', 'w') as f:
-                f.write(out)
-            os.rename(OUTFILE + '.tmp', OUTFILE)
-        except Exception as e:
-            pass
-        buf = ""
+
+def parse(text):
+    freq = 0
+    gtt = 0.0
+    rcs = vcs = vecs = bcs = ccs = 0.0
+    minor = None
+    for raw in text.splitlines():
+        line = ANSI.sub('', raw)
+        if line.startswith('DRM minor'):
+            minor = line
+            m = FREQ.search(line)
+            if m:
+                freq = max(freq, int(m.group(1)))
+            continue
+        # Solo el render node (minor 128) para no duplicar; si no aparece, usa todo.
+        if minor is not None and '128' not in minor:
+            continue
+        vals = [float(v) for v in PCT.findall(line)]
+        if len(vals) >= 5:
+            # columnas de gputop: rcs | vcs | vecs | bcs | ccs
+            rcs += vals[0]
+            vcs += vals[1]
+            vecs += vals[2]
+            bcs += vals[3]
+            ccs += vals[4]
+            mm = MEM.search(line)
+            if mm:
+                gtt += float(mm.group(1)) * (1.0 / 1024 if mm.group(2) == 'M' else 1.0)
+    return (freq, gtt, min(rcs, 100.0), min(vcs, 100.0), min(vecs, 100.0),
+            min(bcs, 100.0), min(ccs, 100.0))
+
+
+while True:
+    try:
+        proc = subprocess.run(
+            ['sudo', '-n', 'gputop', '-d', '1', '-n', '1'],
+            capture_output=True, text=True, timeout=10,
+        )
+        f, gtt, rcs, vcs, vecs, bcs, ccs = parse(proc.stdout)
+        write(f or sysfs_freq(), gtt, rcs, vcs, ccs, bcs)
+    except Exception:
+        write(sysfs_freq(), 0, 0, 0, 0, 0)
+    # 2026-10-28: antes 1 s -> ~28 aperturas/min del device Xe con sudo (40k lineas
+    # de sudo por arranque). Con 55 "TLB invalidation fence timeout" del driver xe
+    # esa misma noche, era el principal candidato al cuelgue de las 02:00.
+    # El panel de conky no necesita mas de una lectura cada 15 s.
+    time.sleep(15)
 EOF
