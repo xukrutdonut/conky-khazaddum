@@ -11,12 +11,18 @@ fetch_one() {
     local OUTFILE="$TMPDIR/rpi_${TAG}.dat"
     local LOCKFILE="$TMPDIR/rpi_${TAG}.lock"
 
-    [[ -f "$LOCKFILE" ]] && return
-    touch "$LOCKFILE"
-    trap "rm -f '$LOCKFILE'" EXIT SIGTERM SIGINT SIGHUP
+    # Mutex por nodo con flock: el fd se libera solo cuando el proceso muere
+    # (incluido SIGKILL). Antes era `test -f` + trap, y un fetch matado a la
+    # fuerza dejaba el .lock huérfano: el nodo no volvía a refrescarse nunca y
+    # el panel de conky quedaba congelado (p.ej. RX480 clavada en 100%).
+    exec 9>"$LOCKFILE" || return
+    flock -n 9 || { exec 9>&-; return; }
 
     local DATA
-    DATA=$(ssh -o ConnectTimeout=6 -o StrictHostKeyChecking=no -o BatchMode=yes \
+    # timeout: si el ssh se cuelga (nodo lento, red a medias) el bucle `wait`
+    # del daemon no puede quedarse esperando indefinidamente.
+    DATA=$(timeout 25 ssh -o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+        -o StrictHostKeyChecking=no -o BatchMode=yes \
         arkantu@"$IP" 'bash -s' << 'REMOTE'
 #!/usr/bin/env bash
 # --- Muestreo inicial CPU/red ---
@@ -139,51 +145,36 @@ UPTIME=$(uptime -p | sed 's/up //')
 KERNEL=$(uname -r)
 IFACE=$(awk '$1~/^eth|^enp|^end|^wl/{print substr($1,1,length($1)-1);exit}' /proc/net/dev 2>/dev/null || ip route | awk '/default/{print $5;exit}')
 
-# --- GPU AMD (solo si hay card con amdgpu) ---
-GPU_PCT=0; GPU_TEMP=0; VRAM_PCT=0; VRAM_USED_MB=0; VRAM_TOTAL_MB=0; GPU_FREQ=0
-for _card in /sys/class/drm/card*/device; do
-    _drv=$(readlink "$_card/driver" 2>/dev/null | xargs basename 2>/dev/null)
-    if [[ "$_drv" == "amdgpu" ]]; then
-        GPU_PCT=$(cat "$_card/gpu_busy_percent" 2>/dev/null || echo 0)
-        _hwmon=$(ls "$_card/hwmon/" 2>/dev/null | head -1)
-        GPU_TEMP=$(( $(cat "$_card/hwmon/$_hwmon/temp1_input" 2>/dev/null || echo 0) / 1000 ))
-        _vused=$(cat "$_card/mem_info_vram_used" 2>/dev/null || echo 0)
-        _vtot=$(cat "$_card/mem_info_vram_total" 2>/dev/null || echo 0)
-        VRAM_USED_MB=$(( _vused / 1048576 ))
-        VRAM_TOTAL_MB=$(( _vtot / 1048576 ))
-        (( VRAM_TOTAL_MB > 0 )) && VRAM_PCT=$(( VRAM_USED_MB * 100 / VRAM_TOTAL_MB ))
-        GPU_FREQ=$(( $(cat "$_card/hwmon/$_hwmon/freq1_input" 2>/dev/null || echo 0) / 1000000 ))
-        break
-    fi
+# --- GPU AMD: se resuelve por dirección PCI, no por cardN ---
+# El índice /dev/dri/cardN cambia entre reinicios y con los conectores HDMI,
+# así que se busca la tarjeta por vendor 0x1002 + driver amdgpu en
+# /sys/bus/pci/devices/<addr>/ y se lee todo desde esa ruta estable.
+GPU_PCT=0; GPU_TEMP=0; VRAM_PCT=0; VRAM_USED_MB=0; VRAM_TOTAL_MB=0; GPU_FREQ=0; GPU_POWER=0; GPU_PCI="none"
+_gpu_dir=""
+for _p in /sys/bus/pci/devices/*/; do
+    [[ "$(cat "${_p}vendor" 2>/dev/null)" == "0x1002" ]] || continue
+    _drv=$(readlink "${_p}driver" 2>/dev/null); _drv="${_drv##*/}"
+    [[ "$_drv" == "amdgpu" ]] || continue
+    _gpu_dir="${_p%/}"
+    break
 done
+if [[ -n "$_gpu_dir" ]]; then
+    GPU_PCI=$(basename "$_gpu_dir")
+    _hwmon=$(ls "$_gpu_dir/hwmon/" 2>/dev/null | head -1)
+    GPU_PCT=$(cat "$_gpu_dir/gpu_busy_percent" 2>/dev/null || echo 0)
+    GPU_TEMP=$(( $(cat "$_gpu_dir/hwmon/$_hwmon/temp1_input" 2>/dev/null || echo 0) / 1000 ))
+    _vused=$(cat "$_gpu_dir/mem_info_vram_used" 2>/dev/null || echo 0)
+    _vtot=$(cat "$_gpu_dir/mem_info_vram_total" 2>/dev/null || echo 0)
+    VRAM_USED_MB=$(( _vused / 1048576 ))
+    VRAM_TOTAL_MB=$(( _vtot / 1048576 ))
+    (( VRAM_TOTAL_MB > 0 )) && VRAM_PCT=$(( VRAM_USED_MB * 100 / VRAM_TOTAL_MB ))
+    GPU_FREQ=$(( $(cat "$_gpu_dir/hwmon/$_hwmon/freq1_input" 2>/dev/null || echo 0) / 1000000 ))
+    _pw=$(cat "$_gpu_dir/hwmon/$_hwmon/power1_input" 2>/dev/null || echo 0)
+    [[ -z "$_pw" ]] && _pw=$(cat "$_gpu_dir/hwmon/$_hwmon/power1_average" 2>/dev/null || echo 0)
+    GPU_POWER=$(( ${_pw:-0} / 1000000 ))
+fi
 
-# --- Hailo PCIe + telemetría real del servicio OCR ---
-HAILO_STATE="no-detectado"; HAILO_SLOT="N/A"; HAILO_POWER="N/A"; HAILO_TEMP="0"; HAILO_UTIL="0"
-for _pf in /sys/bus/pci/devices/*/; do
-    if [ -f "${_pf}uevent" ] && grep -qi "1e60" "${_pf}uevent" 2>/dev/null; then
-        HAILO_SLOT=$(basename "$_pf")
-        if [ -e /dev/hailo0 ]; then
-            HAILO_STATE="activo"
-        elif [ -d "${_pf}driver" ]; then
-            HAILO_STATE="driver-ok"
-        else
-            HAILO_STATE="sin-driver"
-        fi
-        HAILO_POWER=$(cat "${_pf}power_state" 2>/dev/null || echo "D0")
-        break
-    fi
-done
-if [[ "$HAILO_STATE" == "no-detectado" && -e /dev/hailo0 ]]; then
-    HAILO_STATE="activo"
-    HAILO_SLOT="hailo0"
-    HAILO_POWER="D0"
-fi
-# El servicio calcula busy_ms_last60s con las inferencias Hailo completadas.
-# Redondeo hacia arriba: inferencias cortas (<0.5% del minuto) no deben parecer 0%.
-_HAILO_METRICS=$(curl -fsS --max-time 2 http://127.0.0.1:8089/metrics 2>/dev/null || true)
-if [[ -n "$_HAILO_METRICS" ]]; then
-    HAILO_UTIL=$(python3 -c 'import json,sys; m=json.load(sys.stdin); b=max(0,int(m.get("busy_ms_last60s",0))); print(min(100,(b+599)//600) if m.get("hailo_available") and m.get("engine")=="hailo" and b else 0)' <<< "$_HAILO_METRICS" 2>/dev/null || echo "0")
-fi
+
 
 # --- Salida ---
 echo "HOST:$HOST"
@@ -216,11 +207,8 @@ echo "VRAMPCT:$VRAM_PCT"
 echo "VRAMUSEDMB:$VRAM_USED_MB"
 echo "VRAMTOTALMB:$VRAM_TOTAL_MB"
 echo "GPUFREQ:$GPU_FREQ"
-echo "HAILOSTATE:$HAILO_STATE"
-echo "HAILOSLOT:$HAILO_SLOT"
-echo "HAILOPOWER:$HAILO_POWER"
-echo "HAILOTEMP:$HAILO_TEMP"
-echo "HAILOUTIL:$HAILO_UTIL"
+echo "GPUPOWER:$GPU_POWER"
+echo "GPUPCI:$GPU_PCI"
 REMOTE
     )
     local EXIT=$?
@@ -230,7 +218,7 @@ REMOTE
         echo "$DATA" > "$OUTFILE"
         echo "OFFLINE:0" >> "$OUTFILE"
     fi
-    rm -f "$LOCKFILE"
+    exec 9>&-
 }
 
 echo "fetch_rpi_stats.sh iniciado (PID $$)"
