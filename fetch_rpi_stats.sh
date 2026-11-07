@@ -161,7 +161,13 @@ for _pf in /sys/bus/pci/devices/*/; do
         else
             HAILO_STATE="sin-driver"
         fi
-        HAILO_POWER=$(cat "${_pf}power_state" 2>/dev/null || echo "D0")
+        _pw=$(cat "${_pf}power_state" 2>/dev/null || echo "D0")
+        case "$_pw" in
+            D0)        HAILO_POWER="D0 activo" ;;
+            D3hot)     HAILO_POWER="D3hot reposo" ;;
+            D3cold)    HAILO_POWER="D3cold apagado" ;;
+            *)         HAILO_POWER="${_pw:-N/A}" ;;
+        esac
         _hs=$(cat "${_pf}current_link_speed" 2>/dev/null | awk '{print $1}')
         _hw=$(cat "${_pf}current_link_width" 2>/dev/null)
         HAILO_LINK="${_hs:-?}GT/s x${_hw:-?}"
@@ -171,7 +177,7 @@ done
 if [[ "$HAILO_STATE" == "no-detectado" && -e /dev/hailo0 ]]; then
     HAILO_STATE="activo"
     HAILO_SLOT="hailo0"
-    HAILO_POWER="D0"
+    HAILO_POWER="D0 activo"
 fi
 # El servicio calcula busy_ms_last60s con las inferencias Hailo completadas.
 # Redondeo hacia arriba: inferencias cortas (<0.5% del minuto) no deben parecer 0%.
