@@ -145,33 +145,39 @@ UPTIME=$(uptime -p | sed 's/up //')
 KERNEL=$(uname -r)
 IFACE=$(awk '$1~/^eth|^enp|^end|^wl/{print substr($1,1,length($1)-1);exit}' /proc/net/dev 2>/dev/null || ip route | awk '/default/{print $5;exit}')
 
-# --- GPU AMD: se resuelve por dirección PCI, no por cardN ---
-# El índice /dev/dri/cardN cambia entre reinicios y con los conectores HDMI,
-# así que se busca la tarjeta por vendor 0x1002 + driver amdgpu en
-# /sys/bus/pci/devices/<addr>/ y se lee todo desde esa ruta estable.
-GPU_PCT=0; GPU_TEMP=0; VRAM_PCT=0; VRAM_USED_MB=0; VRAM_TOTAL_MB=0; GPU_FREQ=0; GPU_POWER=0; GPU_PCI="none"
-_gpu_dir=""
-for _p in /sys/bus/pci/devices/*/; do
-    [[ "$(cat "${_p}vendor" 2>/dev/null)" == "0x1002" ]] || continue
-    _drv=$(readlink "${_p}driver" 2>/dev/null); _drv="${_drv##*/}"
-    [[ "$_drv" == "amdgpu" ]] || continue
-    _gpu_dir="${_p%/}"
-    break
+# --- Hailo-8L: presencia PCIe + telemetría real del servicio OCR ---
+# Se localiza por vendor/device 1e60 en /sys/bus/pci/devices (en el Pi5 está
+# detrás del puente PCIe 0001:01:00.0). El estado distingue tarjeta ausente,
+# presente sin driver (/dev/hailo0 no existe: no se puede monitorear nada más)
+# y operativa.
+HAILO_STATE="no-detectado"; HAILO_SLOT="N/A"; HAILO_POWER="N/A"; HAILO_LINK="N/A"; HAILO_UTIL=0
+for _pf in /sys/bus/pci/devices/*/; do
+    if [ -f "${_pf}uevent" ] && grep -qi "1e60" "${_pf}uevent" 2>/dev/null; then
+        HAILO_SLOT=$(basename "$_pf")
+        if [ -e /dev/hailo0 ]; then
+            HAILO_STATE="activo"
+        elif [ -L "${_pf}driver" ]; then
+            HAILO_STATE="sin-/dev"
+        else
+            HAILO_STATE="sin-driver"
+        fi
+        HAILO_POWER=$(cat "${_pf}power_state" 2>/dev/null || echo "D0")
+        _hs=$(cat "${_pf}current_link_speed" 2>/dev/null | awk '{print $1}')
+        _hw=$(cat "${_pf}current_link_width" 2>/dev/null)
+        HAILO_LINK="${_hs:-?}GT/s x${_hw:-?}"
+        break
+    fi
 done
-if [[ -n "$_gpu_dir" ]]; then
-    GPU_PCI=$(basename "$_gpu_dir")
-    _hwmon=$(ls "$_gpu_dir/hwmon/" 2>/dev/null | head -1)
-    GPU_PCT=$(cat "$_gpu_dir/gpu_busy_percent" 2>/dev/null || echo 0)
-    GPU_TEMP=$(( $(cat "$_gpu_dir/hwmon/$_hwmon/temp1_input" 2>/dev/null || echo 0) / 1000 ))
-    _vused=$(cat "$_gpu_dir/mem_info_vram_used" 2>/dev/null || echo 0)
-    _vtot=$(cat "$_gpu_dir/mem_info_vram_total" 2>/dev/null || echo 0)
-    VRAM_USED_MB=$(( _vused / 1048576 ))
-    VRAM_TOTAL_MB=$(( _vtot / 1048576 ))
-    (( VRAM_TOTAL_MB > 0 )) && VRAM_PCT=$(( VRAM_USED_MB * 100 / VRAM_TOTAL_MB ))
-    GPU_FREQ=$(( $(cat "$_gpu_dir/hwmon/$_hwmon/freq1_input" 2>/dev/null || echo 0) / 1000000 ))
-    _pw=$(cat "$_gpu_dir/hwmon/$_hwmon/power1_input" 2>/dev/null || echo 0)
-    [[ -z "$_pw" ]] && _pw=$(cat "$_gpu_dir/hwmon/$_hwmon/power1_average" 2>/dev/null || echo 0)
-    GPU_POWER=$(( ${_pw:-0} / 1000000 ))
+if [[ "$HAILO_STATE" == "no-detectado" && -e /dev/hailo0 ]]; then
+    HAILO_STATE="activo"
+    HAILO_SLOT="hailo0"
+    HAILO_POWER="D0"
+fi
+# El servicio calcula busy_ms_last60s con las inferencias Hailo completadas.
+# Redondeo hacia arriba: inferencias cortas (<0.5% del minuto) no deben parecer 0%.
+_HAILO_METRICS=$(curl -fsS --max-time 2 http://127.0.0.1:8089/metrics 2>/dev/null || true)
+if [[ -n "$_HAILO_METRICS" ]]; then
+    HAILO_UTIL=$(python3 -c 'import json,sys; m=json.load(sys.stdin); b=max(0,int(m.get("busy_ms_last60s",0))); print(min(100,(b+599)//600) if m.get("hailo_available") and m.get("engine")=="hailo" and b else 0)' <<< "$_HAILO_METRICS" 2>/dev/null || echo "0")
 fi
 
 
@@ -201,14 +207,11 @@ echo "DISKIO_READ:$_diskr_bps"
 echo "DISKIO_WRITE:$_diskw_bps"
 echo "DISKIO_READ_H:$(_rx_human $_diskr_bps)"
 echo "DISKIO_WRITE_H:$(_rx_human $_diskw_bps)"
-echo "GPUPCT:$GPU_PCT"
-echo "GPUTEMP:$GPU_TEMP"
-echo "VRAMPCT:$VRAM_PCT"
-echo "VRAMUSEDMB:$VRAM_USED_MB"
-echo "VRAMTOTALMB:$VRAM_TOTAL_MB"
-echo "GPUFREQ:$GPU_FREQ"
-echo "GPUPOWER:$GPU_POWER"
-echo "GPUPCI:$GPU_PCI"
+echo "HAILOSTATE:$HAILO_STATE"
+echo "HAILOSLOT:$HAILO_SLOT"
+echo "HAILOPOWER:$HAILO_POWER"
+echo "HAILOLINK:$HAILO_LINK"
+echo "HAILOUTIL:$HAILO_UTIL"
 REMOTE
     )
     local EXIT=$?

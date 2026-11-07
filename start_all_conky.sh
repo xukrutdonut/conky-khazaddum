@@ -47,13 +47,18 @@ echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-def
 # PRE-CREATE DAEMON DATA
 # ==============================================================================
 
-touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_nvme2tb_io.dat 2>/dev/null || true
+touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_nvme2tb_io.dat /tmp/conky_v100.dat /tmp/conky_rx480.dat 2>/dev/null || true
 
-# Start Hailo stats daemon (feeds get_hailo_val.sh cache)
-pkill -f 'fetch_hailo_stats\.sh' 2>/dev/null || true
-if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ]; then
-    setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
-    echo "[$(date '+%H:%M:%S')] Started Hailo stats daemon"
+# Daemons de GPU locales (Tesla V100 por nvidia-smi, RX 480 por USB4)
+pkill -f 'v100_stats\.sh' 2>/dev/null || true
+if [ -x "$CONKY_DIR/v100_stats.sh" ]; then
+    setsid "$CONKY_DIR/v100_stats.sh" >> "$LOG_DIR/conky_v100_daemon.log" 2>&1 200>&- &
+    echo "[$(date '+%H:%M:%S')] Started V100 stats daemon"
+fi
+pkill -f 'rx480_stats\.sh' 2>/dev/null || true
+if [ -x "$CONKY_DIR/rx480_stats.sh" ]; then
+    setsid "$CONKY_DIR/rx480_stats.sh" >> "$LOG_DIR/conky_rx480_daemon.log" 2>&1 200>&- &
+    echo "[$(date '+%H:%M:%S')] Started RX 480 stats daemon"
 fi
 
 # Stats daemon de contenedores IA (OpenVINO :8006 + llama.cpp Pi5 .80:1235)
@@ -61,21 +66,21 @@ fi
 # Start OpenRouter stats daemon (feeds openrouter_pie_gen.py)
 pkill -f 'fetch_openrouter_stats\.py' 2>/dev/null || true
 if [ -x "$CONKY_DIR/fetch_openrouter_stats.py" ]; then
-    setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 &
+    setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 200>&- &
     echo "[$(date '+%H:%M:%S')] Started OpenRouter stats daemon"
 fi
 
 # Start IA Containers stats daemon (feeds containers_render.py cache)
 pkill -f 'fetch_containers_stats\.py' 2>/dev/null || true
 if [ -x "$CONKY_DIR/fetch_containers_stats.py" ]; then
-    setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
+    setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 200>&- &
     echo "[$(date '+%H:%M:%S')] Started IA Containers stats daemon"
 fi
 
 # Start NVMe 2TB I/O daemon (feeds nvme2tb_read.sh / nvme2tb_write.sh)
 pkill -f 'nvme2tb_io_daemon\.sh' 2>/dev/null || true
 if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ]; then
-    setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 &
+    setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 200>&- &
     echo "[$(date '+%H:%M:%S')] Started NVMe 2TB I/O daemon"
 fi
 
@@ -104,6 +109,7 @@ declare -A CONKY_INSTANCES=(
     [rpi4]="$CONKY_DIR/conky_rpi4.conf"
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [openrouter]="$CONKY_DIR/conky_openrouter.conf"
+    [ollama]="$CONKY_DIR/conky_ollama.conf"
     [containers]="$CONKY_DIR/conky_containers.conf"
 )
 
@@ -117,7 +123,7 @@ for name in "${!CONKY_INSTANCES[@]}"; do
     conf="${CONKY_INSTANCES[$name]}"
     log="$LOG_DIR/conky_${name}.log"
     if [ -f "$conf" ]; then
-        setsid conky -c "$conf" >> "$log" 2>&1 &
+        setsid conky -c "$conf" >> "$log" 2>&1 200>&- &
         echo "[$(date '+%H:%M:%S')] Started conky_${name}"
         sleep 0.5
     else
@@ -143,18 +149,22 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
         fi
 
         # Ensure helper daemons are running (use pgrep -f: killall fails for python3 scripts)
-        if [ -x "$CONKY_DIR/fetch_hailo_stats.sh" ] && ! pgrep -f 'fetch_hailo_stats\.sh' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/fetch_hailo_stats.sh" >> "$LOG_DIR/conky_hailo_daemon.log" 2>&1 &
-        fi
         if [ -x "$CONKY_DIR/fetch_openrouter_stats.py" ] && ! pgrep -f 'fetch_openrouter_stats\.py' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 &
+            setsid "$CONKY_DIR/fetch_openrouter_stats.py" >> "$LOG_DIR/conky_openrouter_daemon.log" 2>&1 200>&- &
         fi
         if [ -x "$CONKY_DIR/fetch_containers_stats.py" ] && ! pgrep -f 'fetch_containers_stats\.py' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 &
+            setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 200>&- &
         fi
 
         if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ] && ! pgrep -f 'nvme2tb_io_daemon\.sh' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 &
+            setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 200>&- &
+        fi
+
+        if [ -x "$CONKY_DIR/v100_stats.sh" ] && ! pgrep -f 'v100_stats\.sh' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/v100_stats.sh" >> "$LOG_DIR/conky_v100_daemon.log" 2>&1 200>&- &
+        fi
+        if [ -x "$CONKY_DIR/rx480_stats.sh" ] && ! pgrep -f 'rx480_stats\.sh' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/rx480_stats.sh" >> "$LOG_DIR/conky_rx480_daemon.log" 2>&1 200>&- &
         fi
 
         for name in "${!CONKY_INSTANCES[@]}"; do
@@ -175,7 +185,7 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
                 if [ "$cnt" -lt 5 ]; then
                     FAIL_COUNTS[$name]=$((cnt + 1))
                     echo "[$(date '+%H:%M:%S')] conky_${name} died (attempt $((cnt+1))/5), restarting..." | tee -a "$log"
-                    setsid conky -c "$conf" >> "$log" 2>&1 &
+                    setsid conky -c "$conf" >> "$log" 2>&1 200>&- &
                 else
                     echo "[$(date '+%H:%M:%S')] ERROR: conky_${name} failed 5 times, giving up." | tee -a "$log"
                 fi
