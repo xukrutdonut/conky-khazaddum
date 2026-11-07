@@ -49,17 +49,9 @@ echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-def
 
 touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_nvme2tb_io.dat /tmp/conky_v100.dat /tmp/conky_rx480.dat 2>/dev/null || true
 
-# Daemons de GPU locales (Tesla V100 por nvidia-smi, RX 480 por USB4)
-pkill -f 'v100_stats\.sh' 2>/dev/null || true
-if [ -x "$CONKY_DIR/v100_stats.sh" ]; then
-    setsid "$CONKY_DIR/v100_stats.sh" >> "$LOG_DIR/conky_v100_daemon.log" 2>&1 200>&- &
-    echo "[$(date '+%H:%M:%S')] Started V100 stats daemon"
-fi
-pkill -f 'rx480_stats\.sh' 2>/dev/null || true
-if [ -x "$CONKY_DIR/rx480_stats.sh" ]; then
-    setsid "$CONKY_DIR/rx480_stats.sh" >> "$LOG_DIR/conky_rx480_daemon.log" 2>&1 200>&- &
-    echo "[$(date '+%H:%M:%S')] Started RX 480 stats daemon"
-fi
+# Los daemons de GPU (v100_stats.sh, rx480_stats.sh) se ejecutan como unidades
+# systemd --user (conky-v100-stats / conky-rx480-stats), igual que npu-daemon
+# y fetch-rpi-stats: así no hay dos copias peleándose por el mismo .dat.
 
 # Stats daemon de contenedores IA (OpenVINO :8006 + llama.cpp Pi5 .80:1235)
 
@@ -158,13 +150,6 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
 
         if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ] && ! pgrep -f 'nvme2tb_io_daemon\.sh' >/dev/null 2>&1; then
             setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 200>&- &
-        fi
-
-        if [ -x "$CONKY_DIR/v100_stats.sh" ] && ! pgrep -f 'v100_stats\.sh' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/v100_stats.sh" >> "$LOG_DIR/conky_v100_daemon.log" 2>&1 200>&- &
-        fi
-        if [ -x "$CONKY_DIR/rx480_stats.sh" ] && ! pgrep -f 'rx480_stats\.sh' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/rx480_stats.sh" >> "$LOG_DIR/conky_rx480_daemon.log" 2>&1 200>&- &
         fi
 
         for name in "${!CONKY_INSTANCES[@]}"; do
