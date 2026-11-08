@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Daemon que recolecta stats de los servicios IA locales:
   - Intel OpenVINO Model Server (contenedor ia-gpu-intel-openvino, :8006)
+  - LM Studio (:1234, Vulkan sobre la iGPU Arc) modelo, ctx y tokens/s
   - llama.cpp Vulkan del nodo Pi5 .80 (:1235, RX 480 por PCIe)
 Escribe /tmp/conky_containers.dat para que containers_render.py lo lea.
 
@@ -264,18 +265,29 @@ def parse_metrics(text):
 
 def rpi5_gpu():
     """GPU AMD del nodo .80 (amdgpu) leida por SSH y cacheada 60s.
-    Sin amdgpu la imagen Vulkan cae a llvmpipe y el panel debe decirlo."""
+    Sin amdgpu la imagen Vulkan cae a llvmpipe y el panel debe decirlo.
+    Se resuelve por direccion PCI estable (vendor 0x1002 + driver amdgpu):
+    /dev/dri/cardN cambia de indice entre reinicios."""
     now = time.time()
     if _rpi5_gpu_cache['val'] is not None and now - _rpi5_gpu_cache['t'] < 60:
         return _rpi5_gpu_cache['val']
-    val = {'driver': '', 'busy': 0, 'temp': 0}
+    val = {'driver': '', 'busy': 0, 'temp': 0, 'vram_pct': 0,
+           'vram_used_mb': 0, 'vram_total_mb': 0, 'freq_mhz': 0,
+           'power_w': 0, 'pci': 'none'}
     cmd = (
-        'for d in /sys/class/drm/card*/device; do '
-        'drv=$(grep -m1 "^DRIVER=" $d/uevent 2>/dev/null | cut -d= -f2); '
-        'if [ "$drv" = "amdgpu" ]; then '
-        'busy=$(cat $d/gpu_busy_percent 2>/dev/null); '
-        'tmp=$(cat $d/hwmon/hwmon*/temp1_input 2>/dev/null | head -1); '
-        'echo "$drv|${busy:-0}|${tmp:-0}"; exit 0; fi; done; echo "none|0|0"'
+        'for p in /sys/bus/pci/devices/*/; do '
+        'v=$(cat ${p}vendor 2>/dev/null); '
+        'drv=$(readlink ${p}driver 2>/dev/null); drv=${drv##*/}; '
+        '[ "$v" = "0x1002" ] && [ "$drv" = "amdgpu" ] || continue; '
+        'hw=$(ls ${p}hwmon 2>/dev/null | head -1); '
+        'busy=$(cat ${p}gpu_busy_percent 2>/dev/null); '
+        'tmp=$(cat ${p}hwmon/$hw/temp1_input 2>/dev/null); '
+        'vu=$(cat ${p}mem_info_vram_used 2>/dev/null); '
+        'vt=$(cat ${p}mem_info_vram_total 2>/dev/null); '
+        'fr=$(cat ${p}hwmon/$hw/freq1_input 2>/dev/null); '
+        'pw=$(cat ${p}hwmon/$hw/power1_input 2>/dev/null); '
+        'echo "amdgpu|${busy:-0}|${tmp:-0}|${vu:-0}|${vt:-0}|${fr:-0}|${pw:-0}|$(basename $p)"; '
+        'exit 0; done; echo "none|0|0|0|0|0|0|none"'
     )
     try:
         r = subprocess.run(
@@ -285,11 +297,19 @@ def rpi5_gpu():
         )
         out = (r.stdout or '').strip().splitlines()
         if out:
-            parts = out[-1].split('|')
-            val['driver'] = parts[0]
-            val['busy'] = int(float(parts[1] or 0)) if len(parts) > 1 else 0
-            temp = int(float(parts[2] or 0)) if len(parts) > 2 else 0
+            p = (out[-1].split('|') + [''] * 8)[:8]
+            val['driver'] = p[0]
+            val['busy'] = int(float(p[1] or 0))
+            temp = int(float(p[2] or 0))
             val['temp'] = round(temp / 1000.0) if temp > 1000 else temp
+            vu, vt = int(float(p[3] or 0)), int(float(p[4] or 0))
+            val['vram_used_mb'] = vu // 1048576
+            val['vram_total_mb'] = vt // 1048576
+            if val['vram_total_mb']:
+                val['vram_pct'] = val['vram_used_mb'] * 100 // val['vram_total_mb']
+            val['freq_mhz'] = int(float(p[5] or 0)) // 1000000
+            val['power_w'] = int(float(p[6] or 0)) // 1000000
+            val['pci'] = p[7] or 'none'
     except Exception:
         pass
     _rpi5_gpu_cache.update({'t': now, 'val': val})
@@ -347,7 +367,193 @@ def collect_rpi5():
     }
 
 
-def build_dat(intel, rpi5):
+# ------------------------------------------------- LM Studio (:1234) --
+# LM Studio no publica metricas Prometheus. Fuentes reales que si existen:
+#   * GET /api/v0/models  -> modelos, state (loaded/not-loaded), quant, ctx
+#   * `lms ps --json`     -> status (idle/generating), queued, parallel, peso
+#   * ~/.lmstudio/server-logs/AAAA-MM/AAAA-MM-DD.N.log  (verbose=true)
+#       "[ts][DEBUG] ... print_timing: id 3 | task 346237 | n_gen = 4153,
+#        tg = 72.30 t/s, tg_3s = 90.42 t/s"
+#       "... | prompt eval time = 480.1 ms / 25 tokens (... 52.1 tokens per second)"
+#     El log es la unica fuente de tokens/s. Se lee de forma incremental
+#     (offset) para no releer 5 MB cada 5 s; al arrancar se lee entero una vez
+#     para tener los totales del dia.
+LM_PORT = 1234
+LM_HOST = '127.0.0.1'
+LM_LOG_DIR = os.path.expanduser('~/.lmstudio/server-logs')
+LM_LIVE_WINDOW = 15      # s sin lineas de timing => generacion terminada
+_lm_log = {'path': None, 'offset': 0, 'tail': '', 'tasks': {}, 'gens': 0, 'tok': 0}
+_lm_ps = {'t': 0.0, 'val': {}}
+_lm_last = {'pps': 0.0}
+LM_TS_RE = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]')
+LM_GEN_RE = re.compile(
+    r'print_timing: id\s+(\d+)\s*\|\s*task\s+(\d+)\s*\|\s*n_gen\s*=\s*(\d+),'
+    r'\s*tg\s*=\s*([\d.]+) t/s,\s*tg_\d+s\s*=\s*([\d.]+) t/s'
+)
+LM_PROMPT_RE = re.compile(
+    r'(?:prompt eval time =|prompt processing, n_tokens\s*=\s*\d+,)'
+    r'.*?([\d.]+) tokens per second'
+)
+LM_TASK_RE = re.compile(r'print_timing: id\s+(\d+)\s*\|\s*task\s+(\d+)\s*\|')
+
+
+def lm_log_path():
+    """Log del servidor mas reciente (rota a medianoche)."""
+    try:
+        files = glob.glob(os.path.join(LM_LOG_DIR, '*', '*.log'))
+        return max(files, key=os.path.getmtime) if files else None
+    except Exception:
+        return None
+
+
+def lm_parse_lines(lines, st, now):
+    for line in lines:
+        ts = now
+        tsm = LM_TS_RE.match(line)
+        if tsm:
+            try:
+                ts = time.mktime(time.strptime(tsm.group(1), '%Y-%m-%d %H:%M:%S'))
+            except Exception:
+                ts = now
+        m = LM_GEN_RE.search(line)
+        if m:
+            task = int(m.group(2))
+            n_gen = int(m.group(3))
+            t = st['tasks'].get(task)
+            if t is None:
+                t = {'task': task, 'n_gen': 0}
+                st['tasks'][task] = t
+            if not t.get('counted'):
+                t['counted'] = True
+                st['gens'] += 1
+            if n_gen > t['n_gen']:
+                st['tok'] += n_gen - t['n_gen']
+            t.update({'n_gen': max(n_gen, t['n_gen']), 'ts': ts,
+                      'tg': float(m.group(4)), 'tg3': float(m.group(5)),
+                      'slot': int(m.group(1))})
+            continue
+        m = LM_PROMPT_RE.search(line)
+        if m:
+            tm = LM_TASK_RE.search(line)
+            if not tm:
+                continue
+            task = int(tm.group(2))
+            t = st['tasks'].setdefault(task, {'task': task, 'n_gen': 0})
+            t['pps'] = float(m.group(1))
+            _lm_last['pps'] = t['pps']
+            t.setdefault('ts', ts)
+
+
+def lm_read_log(st, now):
+    """Lectura incremental del log: reconstruye el dia al arrancar/rotar."""
+    path = lm_log_path()
+    if not path:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if path != st['path'] or size < st['offset']:
+        st.update({'path': path, 'offset': 0, 'tail': '', 'tasks': {},
+                   'gens': 0, 'tok': 0})
+    if size <= st['offset']:
+        return
+    try:
+        with open(path, 'r', errors='replace') as f:
+            f.seek(st['offset'])
+            chunk = f.read()
+    except OSError:
+        return
+    st['offset'] = size
+    lines = (st['tail'] + chunk).split('\n')
+    st['tail'] = lines.pop() if lines else ''
+    lm_parse_lines(lines, st, now)
+    if len(st['tasks']) > 400:       # poda: solo las 100 tareas recientes
+        keep = sorted(st['tasks'].values(), key=lambda t: t.get('ts', 0))[-100:]
+        st['tasks'] = {t['task']: t for t in keep}
+
+
+def lm_ps_info():
+    """`lms ps --json` cacheado 60 s (status, cola, slots, tamano del modelo)."""
+    now = time.time()
+    if _lm_ps['val'] and now - _lm_ps['t'] < 60:
+        return _lm_ps['val']
+    val = {}
+    lms = '/usr/local/bin/lms' if os.path.exists('/usr/local/bin/lms') else 'lms'
+    try:
+        r = subprocess.run([lms, 'ps', '--json'], capture_output=True,
+                           text=True, timeout=8)
+        if r.returncode == 0 and r.stdout.strip():
+            for m in json.loads(r.stdout.strip()):
+                key = m.get('modelKey') or m.get('identifier') or '?'
+                val[key] = {
+                    'status': m.get('status', ''),
+                    'queued': int(m.get('queued', 0) or 0),
+                    'parallel': int(m.get('parallel', 0) or 0),
+                    'ctx': int(m.get('contextLength', 0) or 0),
+                    'size_gb': round((m.get('sizeBytes') or 0) / 1073741824.0, 1),
+                    'display': m.get('displayName') or key,
+                }
+    except Exception:
+        val = {}
+    _lm_ps.update({'t': now, 'val': val})
+    return val
+
+
+def collect_lmstudio():
+    """Estado del servidor LM Studio local (:1234) + ritmo de generacion."""
+    now = time.time()
+    lm_read_log(_lm_log, now)
+    models = http_get_json(f'http://{LM_HOST}:{LM_PORT}/api/v0/models')
+    running = isinstance(models, dict) and isinstance(models.get('data'), list)
+    ps = lm_ps_info() if running else {}
+
+    loaded = []
+    total = 0
+    if running:
+        for m in models.get('data', []):
+            total += 1
+            if m.get('state') == 'loaded':
+                mid = m.get('id', '?')
+                p = ps.get(mid, {})
+                loaded.append({
+                    'id': mid,
+                    'quant': m.get('quantization') or '?',
+                    'ctx': int(m.get('loaded_context_length')
+                               or m.get('max_context_length') or 0),
+                    'parallel': p.get('parallel', 0),
+                    'queued': p.get('queued', 0),
+                    'size_gb': p.get('size_gb', 0),
+                })
+
+    tasks = [t for t in _lm_log['tasks'].values() if 'tg' in t and t.get('ts')]
+    live = [t for t in tasks if t.get('ts') and now - t['ts'] <= LM_LIVE_WINDOW]
+    live.sort(key=lambda t: t['ts'])
+    gen = live[-1] if live else None
+    older = [t for t in tasks if t.get('ts') and now - t['ts'] > LM_LIVE_WINDOW]
+    last = max(older, key=lambda t: t['ts']) if older else None
+    if not live:
+        last = max((t for t in tasks if t.get('ts')), key=lambda t: t['ts'],
+                   default=None)
+
+    return {
+        'running': running,
+        'models_total': total,
+        'models_loaded': loaded,
+        'generating': gen is not None,
+        'g_tg': gen['tg'] if gen else 0.0,
+        'g_tg3': gen['tg3'] if gen else 0.0,
+        'g_tok': gen['n_gen'] if gen else 0,
+        'g_pps': (gen.get('pps') if gen else 0.0) or _lm_last['pps'],
+        'last_tg': last['tg'] if last else 0.0,
+        'last_tok': last['n_gen'] if last else 0,
+        'last_age': int(now - last['ts']) if last else -1,
+        'today_gens': _lm_log['gens'],
+        'today_tok': int(_lm_log['tok']),
+    }
+
+
+def build_dat(intel, lm, rpi5):
     lines = []
     # ---- Intel OpenVINO
     lines.append(f"INTEL_RUNNING:{1 if intel['running'] else 0}")
@@ -374,6 +580,29 @@ def build_dat(intel, rpi5):
         lines.append(f"INTEL_RENDER:{int(gu.get('render', 0))}")
         lines.append(f"INTEL_COMPUTE:{int(gu.get('compute', 0))}")
 
+    # ---- LM Studio (:1234, misma iGPU Arc por Vulkan)
+    lines.append(f"LM_RUNNING:{1 if lm['running'] else 0}")
+    lines.append(f"LM_STATE:{'listo' if lm['running'] else 'sin respuesta'}")
+    lines.append(f"LM_MODELS_TOTAL:{lm['models_total']}")
+    lines.append(f"LM_MODELS_LOADED:{len(lm['models_loaded'])}")
+    for i, m in enumerate(lm['models_loaded'][:3]):
+        lines.append(f"LM_M{i}_NAME:{m['id']}")
+        lines.append(f"LM_M{i}_QUANT:{m['quant']}")
+        lines.append(f"LM_M{i}_CTX:{m['ctx']}")
+        lines.append(f"LM_M{i}_SLOTS:{m['parallel']}")
+        lines.append(f"LM_M{i}_QUEUE:{m['queued']}")
+        lines.append(f"LM_M{i}_SIZE:{m['size_gb']}")
+    lines.append(f"LM_GENERATING:{1 if lm['generating'] else 0}")
+    lines.append(f"LM_TG:{lm['g_tg']:.1f}")
+    lines.append(f"LM_TG3:{lm['g_tg3']:.1f}")
+    lines.append(f"LM_TOK:{lm['g_tok']}")
+    lines.append(f"LM_PPS:{lm['g_pps']:.0f}")
+    lines.append(f"LM_LAST_TG:{lm['last_tg']:.1f}")
+    lines.append(f"LM_LAST_TOK:{lm['last_tok']}")
+    lines.append(f"LM_LAST_AGE:{lm['last_age']}")
+    lines.append(f"LM_TODAY_GENS:{lm['today_gens']}")
+    lines.append(f"LM_TODAY_TOK:{lm['today_tok']}")
+
     # ---- Pi5 .80: llama.cpp Vulkan (RX 480 por PCIe)
     lines.append(f"RPI_STATE:{rpi5['state']}")
     lines.append(f"RPI_RUNNING:{1 if rpi5['running'] else 0}")
@@ -392,6 +621,12 @@ def build_dat(intel, rpi5):
     lines.append(f"RPI_GPU_DRIVER:{gpu['driver']}")
     lines.append(f"RPI_GPU_BUSY:{int(gpu['busy'])}")
     lines.append(f"RPI_GPU_TEMP:{int(gpu['temp'])}")
+    lines.append(f"RPI_GPU_VRAMPCT:{int(gpu['vram_pct'])}")
+    lines.append(f"RPI_GPU_VRAMUSED:{int(gpu['vram_used_mb'])}")
+    lines.append(f"RPI_GPU_VRAMTOTAL:{int(gpu['vram_total_mb'])}")
+    lines.append(f"RPI_GPU_FREQ:{int(gpu['freq_mhz'])}")
+    lines.append(f"RPI_GPU_PWR:{int(gpu['power_w'])}")
+    lines.append(f"RPI_GPU_PCI:{gpu['pci']}")
 
     write_dat(lines)
 
@@ -401,8 +636,9 @@ def main():
         try:
             gpu = read_intel_gpu_stats()
             intel = collect_intel(gpu)
+            lm = collect_lmstudio()
             rpi5 = collect_rpi5()
-            build_dat(intel, rpi5)
+            build_dat(intel, lm, rpi5)
         except Exception:
             pass
         time.sleep(INTERVAL)

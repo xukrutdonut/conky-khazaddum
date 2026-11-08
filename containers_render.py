@@ -4,25 +4,73 @@
 import os
 
 DAT_FILE = '/tmp/conky_containers.dat'
+HELPER_DIR = os.path.expanduser('~/.config/conky/state')
 
 
-def write_helper(path, key):
-    """Crea un script helper en /tmp que extrae un valor del .dat para execbar."""
+def helper(name):
+    """Ruta persistente del helper (sobrevive reboots; /tmp no)."""
+    return os.path.join(HELPER_DIR, name)
+
+
+def write_helper(name, key):
+    """Crea un script helper que extrae un valor del .dat para execgraph/execbar.
+
+    Se reescribe SOLO si cambia el contenido y de forma atómica: Conky ejecuta
+    estos scripts cada ciclo y reescribirlos siempre provocaba carreras
+    ("Text file busy", "s.dat: not found" en el log de conky).
+    """
+    os.makedirs(HELPER_DIR, exist_ok=True)
+    path = helper(name)
     content = (
         "#!/bin/sh\n"
         f"awk -F: '$1==\"{key}\" {{print $2; exit}}' {DAT_FILE}\n"
     )
-    with open(path, 'w') as f:
+    try:
+        with open(path) as f:
+            if f.read() == content:
+                return path
+    except OSError:
+        pass
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
         f.write(content)
-    os.chmod(path, 0o755)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    return path
 
 
 def bar(path):
     return f"${{execbar 4,344 {path}}}"
 
 
+def fmt_tok(n):
+    """Tokens abreviados: 987 / 48.2k / 1.03M."""
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1000:
+        return f"{n/1000:.1f}k"
+    return str(n)
+
+
+def fmt_age(sec):
+    sec = int(sec)
+    if sec < 0:
+        return '-'
+    if sec < 60:
+        return f'{sec}s'
+    if sec < 3600:
+        return f'{sec//60}m'
+    return f'{sec//3600}h{(sec%3600)//60:02d}'
+
+
 def render():
-    write_helper('/tmp/conky_intel_gpu.sh', 'INTEL_GPU_BUSY')
+    # Helpers siempre presentes: si faltan, Conky falla al evaluar execgraph
+    write_helper('conky_intel_gpu.sh', 'INTEL_GPU_BUSY')
+    write_helper('conky_intel_pwr.sh', 'INTEL_GPU_PWR')
+    write_helper('conky_rpi5_bar.sh', 'RPI_GPU_BUSY')
+    write_helper('conky_rpi5_vram.sh', 'RPI_GPU_VRAMPCT')
+    write_helper('conky_lmstudio_tg.sh', 'LM_TG')
 
     if not os.path.exists(DAT_FILE):
         print("${color4}${alignc}IA GPU${color}")
@@ -66,8 +114,11 @@ def render():
             print("${color5}(Sin modelos cargados)${color}")
         gu = data.get('INTEL_GPU_BUSY', '0')
         gp = data.get('INTEL_GPU_PWR', '0')
+        write_helper('conky_intel_pwr.sh', 'INTEL_GPU_PWR')
         print(f"${{color1}}Uso GPU: ${{color2}}{gu}%${{color}}  ${{color1}}Pwr: ${{color2}}{gp}W${{color}}")
-        print(bar('/tmp/conky_intel_gpu.sh'))
+        # Histórico: ancho 344 px × update_interval = ~28 min de ventana
+        print(f"${{execgraph {helper('conky_intel_gpu.sh')} 30,344 5af78e ff6e6e 100}}")
+        print(f"${{execgraph {helper('conky_intel_pwr.sh')} 18,344 ffb347 ff6e6e}}")
         if n_avail:
             names = []
             for i in range(min(n_avail, 4)):
@@ -77,6 +128,58 @@ def render():
             if names:
                 print(f"${{color1}}Disponibles: ${{color}}{', '.join(names)}${{color}}")
 
+    # ══════════ LM Studio — Vulkan sobre la iGPU Arc ══════════
+    print()
+    print("${color4}── LM Studio — Vulkan :1234 ──${color}")
+    if data.get('LM_RUNNING', '0') != '1':
+        print("${color1}Estado: ${color3}sin respuesta${color}")
+        print("${color1}Servidor: ${color3}LM Studio cerrado${color}")
+    else:
+        n_load = int(data.get('LM_MODELS_LOADED', '0'))
+        n_tot = int(data.get('LM_MODELS_TOTAL', '0'))
+        gen = data.get('LM_GENERATING', '0') == '1'
+        st_col = 'color2' if gen else 'color1'
+        st_txt = 'generando' if gen else 'idle'
+        print(f"${{color1}}Estado: ${{{st_col}}}{st_txt}${{color}}  "
+              f"${{color1}}Modelos: ${{color2}}{n_load}/{n_tot}${{color}}")
+        if n_load == 0:
+            print("${color5}(Ningún modelo cargado)${color}")
+        for i in range(min(n_load, 2)):
+            name = data.get(f'LM_M{i}_NAME', '?')
+            short = name if len(name) <= 30 else name[:27] + '...'
+            quant = data.get(f'LM_M{i}_QUANT', '?')
+            ctx = int(float(data.get(f'LM_M{i}_CTX', '0')))
+            print(f"${{color2}}▶ {short}${{color}} ${{color1}}({quant}, "
+                  f"ctx {ctx//1024}k)${{color}}")
+            if i == 0:
+                if gen:
+                    pps = float(data.get('LM_PPS', '0'))
+                    extra = f" · prompt {pps:.0f} t/s" if pps > 0 else ''
+                    print(f"${{color1}}Gen: ${{color2}}{data.get('LM_TG', '0')} t/s"
+                          f"${{color}}{extra}${{color1}} · "
+                          f"${{color2}}{fmt_tok(data.get('LM_TOK', '0'))}${{color1}} tok${{color}}")
+                else:
+                    age = int(float(data.get('LM_LAST_AGE', '-1')))
+                    if age >= 0:
+                        print(f"${{color1}}Última: hace ${{color2}}{fmt_age(age)}${{color}}"
+                              f"${{color1}} · ${{color2}}{data.get('LM_LAST_TG', '0')} t/s${{color}}"
+                              f"${{color1}} · ${{color2}}{fmt_tok(data.get('LM_LAST_TOK', '0'))} tok${{color}}")
+                    else:
+                        print("${color5}(Sin generaciones registradas)${color}")
+        if n_load:
+            slots = data.get('LM_M0_SLOTS', '0')
+            queue = data.get('LM_M0_QUEUE', '0')
+            peso = float(data.get('LM_M0_SIZE', '0'))
+            print(f"${{color1}}Peso: ${{color2}}{peso:.1f} GB${{color}}  "
+                  f"${{color1}}Slots: ${{color2}}{slots}${{color}}  "
+                  f"${{color1}}Cola: ${{color2}}{queue}${{color}}")
+        print(f"${{color1}}Hoy: ${{color2}}{data.get('LM_TODAY_GENS', '0')}${{color}}"
+              f"${{color1}} gen · ${{color2}}"
+              f"{fmt_tok(data.get('LM_TODAY_TOK', '0'))}${{color}}"
+              f"${{color1}} tok${{color}}")
+        # Histórico de tokens/s (ventana ~28 min a 5 s); 100 = techo de la escala
+        print(f"${{execgraph {helper('conky_lmstudio_tg.sh')} 16,344 5eb8ff ffb347 100}}")
+
     # ══════════ Pi5 .80 — llama.cpp Vulkan ══════════
     print()
     print("${color4}── Pi5 .80 — llama.cpp Vulkan ──${color}")
@@ -85,13 +188,12 @@ def render():
     sc = 'color2' if running else 'color3'
     print(f"${{color1}}Estado: ${{{sc}}}{state}${{color}}  ${{color1}}:1235${{color}}")
     gpu_on = data.get('RPI_GPU_DRIVER', '') == 'amdgpu'
-    write_helper('/tmp/conky_rpi5_bar.sh', 'RPI_GPU_BUSY' if gpu_on else 'RPI_KV')
+    write_helper('conky_rpi5_bar.sh', 'RPI_GPU_BUSY' if gpu_on else 'RPI_KV')
+    write_helper('conky_rpi5_vram.sh', 'RPI_GPU_VRAMPCT')
     if not running:
         http = data.get('RPI_HTTP', '000')
         detail = 'proceso caído' if http == '000' else f'HTTP {http}'
         print(f"${{color1}}Nodo: ${{color5}}192.168.0.80${{color}}  ${{color3}}{detail}${{color}}")
-        if not gpu_on:
-            print("${color5}GPU: sin amdgpu (llvmpipe/V3D)${color}")
     else:
         model = data.get('RPI_MODEL', '?')
         quant = data.get('RPI_QUANT', '-')
@@ -105,13 +207,20 @@ def render():
                   f"${{color1}}Prompt: ${{color2}}{data.get('RPI_PPS', '0')} t/s${{color}}")
             print(f"${{color1}}Peticiones: ${{color2}}{data.get('RPI_PROC', '0')}${{color}} ${{color1}}en curso, "
                   f"${{color}}{data.get('RPI_DEFER', '0')}${{color}} ${{color1}}en cola${{color}}")
-        if gpu_on:
-            print(f"${{color1}}GPU RX 480: ${{color2}}{data.get('RPI_GPU_BUSY', '0')}%${{color}}  "
-                  f"${{color1}}Temp: ${{color2}}{data.get('RPI_GPU_TEMP', '0')}°C${{color}}")
-            print(bar('/tmp/conky_rpi5_bar.sh'))
-        else:
-            print("${color5}GPU: amdgpu ausente (llvmpipe)${color}")
-            print(bar('/tmp/conky_rpi5_bar.sh'))
+    # La GPU se muestra siempre: sirve igual con llama.cpp parado
+    if gpu_on:
+        print(f"${{color1}}GPU RX 480: ${{color2}}{data.get('RPI_GPU_BUSY', '0')}%${{color}}  "
+              f"${{color1}}Temp: ${{color2}}{data.get('RPI_GPU_TEMP', '0')}°C${{color}}  "
+              f"${{color1}}VRAM: ${{color2}}{data.get('RPI_GPU_VRAMPCT', '0')}%${{color}}")
+        print(f"${{color1}}Frec: ${{color2}}{data.get('RPI_GPU_FREQ', '0')} MHz${{color}}  "
+              f"${{color1}}Pwr: ${{color2}}{data.get('RPI_GPU_PWR', '0')} W${{color}}  "
+              f"${{color5}}{data.get('RPI_GPU_PCI', 'none')}${{color}}")
+        # Histórico: uso de GPU y VRAM (ventana ~28 min a 5 s)
+        print(f"${{execgraph {helper('conky_rpi5_bar.sh')} 30,344 5af78e ff6e6e 100}}")
+        print(f"${{execgraph {helper('conky_rpi5_vram.sh')} 18,344 5eb8ff ffb347 100}}")
+    else:
+        print("${color5}GPU: amdgpu ausente (llvmpipe)${color}")
+        print(bar(helper('conky_rpi5_bar.sh')))
 
 if __name__ == '__main__':
     render()
