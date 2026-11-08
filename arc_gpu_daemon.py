@@ -7,7 +7,7 @@ Sustituye al sondeo con `gputop -d 1 -n 1` cada 15 s, que abría el device
 compositor de hasta 239 s y finalmente cuelgue total del escritorio.
 
 Este daemon NO abre el device: sólo lee /proc/<pid>/fdinfo/* de los
-clientes DRM (necesita root para ver fdinfo de otros UID, p.ej. contenedores).
+clientes DRM (corre como root para ver fdinfo de otros UID, p.ej. contenedores).
 
 Detalles del driver xe (comprobados en esta máquina):
   * un mismo cliente exporta varios fds (renderD128 + card0) y varios procesos
@@ -15,16 +15,21 @@ Detalles del driver xe (comprobados en esta máquina):
     memoria se cuenta 3-5 veces.
   * drm-cycles-<motor> es el tiempo activo y drm-total-cycles-* el reloj de
     referencia global: ocupación = 100 * delta(cycles) / delta(total).
+  * atribución por proceso: `ovms` (contenedor OpenVINO, cid del proceso ovms)
+    y el backend llama.cpp de LM Studio (`llama-server` bajo ~/.lmstudio).
+    Sin esa atribución los dos motores comparten la misma iGPU y el panel
+    enseñaría el mismo número en las dos secciones.
 
 Salida (formato que espera Conky):
-  FREQ:<MHz>  GTT:<GiB>  RNDR:<%>  VIDEO:<%>  COMPUTE:<%>  COPY:<%
+  FREQ:<MHz>  GTT:<GiB>  RNDR:<%>  VIDEO:<%>  COMPUTE:<%>  COPY:<%>
+  OVMS:<%>  LMBUSY:<%>
 """
 import os
 import sys
 import time
 
 OUTFILE = os.environ.get("ARC_OUTFILE", "/tmp/conky_arc.dat")
-INTERVAL = float(os.environ.get("ARC_INTERVAL", "15"))
+INTERVAL = float(os.environ.get("ARC_INTERVAL", "5"))
 DRI = "/dev/dri/"
 ENGINES = ("rcs", "vcs", "vecs", "bcs", "ccs")
 FREQ_PATHS = (
@@ -44,12 +49,32 @@ def read_freq():
     return vals.get("act_freq") or vals.get("cur_freq") or 0
 
 
+def classify(comm, cmd):
+    """Motor propietario del cliente DRM, o None si es ruido de escritorio."""
+    s = f"{comm} {cmd}".lower()
+    if "ovms" in s:
+        return "ovms"
+    if "llama-server" in s and "lmstudio" in s:
+        return "lm"
+    return None
+
+
 def drm_clients():
-    """{clave_cliente: {clave_drm: valor}} agrupado por drm-client-id."""
+    """{clave_cliente: {'v': {clave_drm: valor}, 'own': motor}} por drm-client-id."""
     out = {}
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit():
             continue
+        try:
+            comm = open(f"/proc/{entry.name}/comm").read().strip()
+        except OSError:
+            comm = "?"
+        try:
+            with open(f"/proc/{entry.name}/cmdline", "rb") as f:
+                cmd = f.read().decode("utf8", "replace").replace("\0", " ").strip()
+        except OSError:
+            cmd = ""
+        own = classify(comm, cmd)
         try:
             fds = os.scandir(f"/proc/{entry.name}/fd")
         except (PermissionError, FileNotFoundError, ProcessLookupError):
@@ -80,24 +105,25 @@ def drm_clients():
                 cid = vals.get("drm-client-id")
                 key = (cid, target) if cid is not None else (fd.path, target)
                 prev = out.get(key)
-                if prev is None or vals.get("drm-total-cycles-rcs", 0) > prev.get(
+                if prev is None or vals.get("drm-total-cycles-rcs", 0) > prev["v"].get(
                     "drm-total-cycles-rcs", 0
                 ):
-                    out[key] = vals
+                    out[key] = {"v": vals, "own": own}
     return out
 
 
 def sample(prev):
     clients = drm_clients()
-    gtt_kib = sum(v.get("drm-total-gtt", 0) for v in clients.values())
+    gtt_kib = sum(c["v"].get("drm-total-gtt", 0) for c in clients.values())
 
     busy = dict.fromkeys(ENGINES, 0.0)
+    own = {"ovms": 0.0, "lm": 0.0}
     if prev:
         dtot = max(
             (
-                v.get("drm-total-cycles-rcs", 0)
-                - prev.get(k, {}).get("drm-total-cycles-rcs", 0)
-                for k, v in clients.items()
+                c["v"].get("drm-total-cycles-rcs", 0)
+                - prev.get(k, {}).get("v", {}).get("drm-total-cycles-rcs", 0)
+                for k, c in clients.items()
                 if k in prev
             ),
             default=0,
@@ -106,15 +132,29 @@ def sample(prev):
             for eng in ENGINES:
                 key = f"drm-cycles-{eng}"
                 delta = sum(
-                    max(v.get(key, 0) - prev.get(k, {}).get(key, 0), 0)
-                    for k, v in clients.items()
+                    max(c["v"].get(key, 0) - prev.get(k, {}).get("v", {}).get(key, 0), 0)
+                    for k, c in clients.items()
                     if k in prev
                 )
                 busy[eng] = max(0.0, min(100.0, delta / dtot * 100.0))
-    return clients, gtt_kib, busy
+            # Por motor: el motor más cargado de cada cliente suyo (evita sumar
+            # el mismo trabajo en rcs+ccs) y luego se reparte sobre el reloj global.
+            per = {"ovms": 0, "lm": 0}
+            for k, c in clients.items():
+                if not c["own"] or k not in prev:
+                    continue
+                pv = prev[k]["v"]
+                d = max(
+                    max(c["v"].get(f"drm-cycles-{e}", 0) - pv.get(f"drm-cycles-{e}", 0), 0)
+                    for e in ENGINES
+                )
+                per[c["own"]] += d
+            for name, d in per.items():
+                own[name] = max(0.0, min(100.0, d / dtot * 100.0))
+    return clients, gtt_kib, busy, own
 
 
-def write(freq, gtt_gib, busy):
+def write(freq, gtt_gib, busy, own):
     out = (
         f"FREQ:{freq:.0f}\n"
         f"GTT:{gtt_gib:.1f}\n"
@@ -122,6 +162,8 @@ def write(freq, gtt_gib, busy):
         f"VIDEO:{busy['vcs']:.0f}\n"
         f"COMPUTE:{busy['ccs']:.0f}\n"
         f"COPY:{busy['bcs']:.0f}\n"
+        f"OVMS:{own['ovms']:.0f}\n"
+        f"LMBUSY:{own['lm']:.0f}\n"
     )
     tmp = f"{OUTFILE}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
@@ -136,13 +178,14 @@ def main():
     prev = None
     while True:
         try:
-            clients, gtt_kib, busy = sample(prev)
+            clients, gtt_kib, busy, own = sample(prev)
             prev = clients
-            write(read_freq(), gtt_kib / 1024.0 / 1024.0, busy)
+            write(read_freq(), gtt_kib / 1024.0 / 1024.0, busy, own)
             if verbose:
                 print(
                     f"clientes={len(clients)} gtt={gtt_kib/1024/1024:.2f}GiB "
-                    + " ".join(f"{e}={busy[e]:.1f}%" for e in ENGINES),
+                    + " ".join(f"{e}={busy[e]:.1f}%" for e in ENGINES)
+                    + f" ovms={own['ovms']:.0f}% lm={own['lm']:.0f}%",
                     file=sys.stderr,
                     flush=True,
                 )

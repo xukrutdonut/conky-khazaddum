@@ -18,6 +18,7 @@ import subprocess
 import time
 
 DAT_FILE = '/tmp/conky_containers.dat'
+ARC_DAT = '/tmp/conky_arc.dat'   # lo escribe arc-gpu-daemon (fdinfo pasivo)
 INTERVAL = 5          # poll cada 5s
 INTEL_PORT = 8006
 # Nodo Pi5 .80: llama.cpp Vulkan (RX 480 por PCIe) sirviendo en :1235
@@ -26,6 +27,85 @@ RPI5_PORT = 1235
 RPI5_BASE = f'http://{RPI5_HOST}:{RPI5_PORT}'
 _rpi5_prev = {'t': 0.0, 'pred': 0.0, 'prompt': 0.0}
 _rpi5_gpu_cache = {'t': 0.0, 'val': None}
+
+# ══ Histórico de uso de GPU (gráfica de los 3 motores) ══
+# 180 muestras x 5 s = 15 min; se agrega por máximos a SPARK_W columnas para que
+# los picos no se pierdan. Persiste en disco para no vaciarse al reiniciar.
+HIST_FILE = '/tmp/conky_gpu_hist.json'
+HIST_MAX = 180
+SPARK_W = 46
+_SPARK_BLOCKS = '▁▂▃▄▅▆▇█'
+_hist = {}
+
+
+def hist_load():
+    global _hist
+    try:
+        import json
+        with open(HIST_FILE) as f:
+            d = json.load(f)
+        _hist = {k: [float(x) for x in v][-HIST_MAX:] for k, v in d.items()}
+    except Exception:
+        _hist = {}
+
+
+def hist_save():
+    try:
+        import json
+        tmp = HIST_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(_hist, f)
+        os.replace(tmp, HIST_FILE)
+    except Exception:
+        pass
+
+
+def hist_push(key, val):
+    try:
+        v = max(0.0, min(100.0, float(val)))
+    except Exception:
+        v = 0.0
+    h = _hist.setdefault(key, [])
+    h.append(v)
+    del h[:-HIST_MAX]
+
+
+def hist_cols(key):
+    """Columnas del histórico: SPARK_W valores 0-100 (max de cada tramo)."""
+    h = _hist.get(key) or [0.0]
+    n = len(h)
+    cols = []
+    for i in range(SPARK_W):
+        a = int(i * n / SPARK_W)
+        b = max(a + 1, int((i + 1) * n / SPARK_W))
+        cols.append(max(h[a:b] or [0.0]))
+    # pad de ceros a la izquierda para que el ancho sea constante
+    return [0.0] * (SPARK_W - len(cols)) + cols
+
+
+def spark(key):
+    """Histórico de 2 filas de bloques (17 niveles) con color por nivel.
+
+    Devuelve (fila_superior, fila_inferior). Cada columna es una muestra
+    agregada; la fila inferior cubre 0-50 %% y la superior 50-100 %%.
+    """
+    top, bot = [], []
+    ctop = cbot = None
+    for v in hist_cols(key):
+        v = max(0.0, min(100.0, v))
+        lvl = int(round(v / 100.0 * 16))
+        col = '${color3}' if v >= 85 else ('${color4}' if v >= 60 else '${color2}')
+        if col != ctop:
+            top.append(col)
+            ctop = col
+        if col != cbot:
+            bot.append(col)
+            cbot = col
+        top.append(' ' if lvl <= 8 else _SPARK_BLOCKS[lvl - 9])
+        bot.append('█' if lvl >= 8 else _SPARK_BLOCKS[lvl])
+    top.append('${color}')
+    bot.append('${color}')
+    return ''.join(top), ''.join(bot)
 
 
 def write_dat(lines):
@@ -75,85 +155,61 @@ def port_open(port, timeout=1):
         return False
 
 
-def read_intel_gpu_stats():
-    """Lee uso real de Intel Arc via intel_gpu_top -J (streaming).
-    Lee el primer objeto JSON completo y mata el proceso.
-    Devuelve dict con gpu_busy%, gpu_power_w, pkg_power_w, render%, compute%."""
-    p = None
+def read_arc_dat():
+    """Lee /tmp/conky_arc.dat, que escribe arc-gpu-daemon (fdinfo pasivo)."""
+    vals = {}
     try:
-        p = subprocess.Popen(
-            ['intel_gpu_top', '-J', '-s', '1000'],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-        )
-        assert p.stdout is not None
-        buf = ''
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            line = p.stdout.readline()
-            if not line:
-                break
-            buf += line
-            idx = buf.find('{')
-            if idx == -1:
-                continue
-            depth = 0
-            end = -1
-            for i, c in enumerate(buf[idx:], idx):
-                if c == '{':
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-            if end > 0:
-                obj = json.loads(buf[idx:end])
-                rc6 = obj.get('rc6', {}).get('value', 100)
-                gpu_busy = max(0, 100 - rc6)
-                power = obj.get('power', {})
-                engines = obj.get('engines', {})
-                render = engines.get('Render/3D', {}).get('busy', 0)
-                compute = engines.get('Compute', {}).get('busy', 0)
-                if compute == 0:
-                    for k, v in engines.items():
-                        if v.get('busy', 0) > 0 and k != 'Render/3D':
-                            compute = max(compute, v['busy'])
-                return {
-                    'gpu_busy': round(gpu_busy, 1),
-                    'gpu_power': round(power.get('GPU', 0), 2),
-                    'pkg_power': round(power.get('Package', 0), 2),
-                    'render': round(render, 1),
-                    'compute': round(compute, 1),
-                }
+        with open(ARC_DAT) as f:
+            for line in f:
+                k, _, v = line.partition(':')
+                if v.strip():
+                    vals[k.strip()] = v.strip()
+    except OSError:
+        return None
+    return vals
+
+
+def read_intel_gpu_stats():
+    """Uso de la iGPU por OVMS según el daemon ARC (claves OVMS/RNDR/COMPUTE).
+
+    intel_gpu_top NO soporta el driver Xe de esta Arc: devolvía None y dejaba
+    las gráficas del panel siempre a 0. El daemon lee /proc/<pid>/fdinfo de los
+    clientes DRM y publica el reparto por motor (OVMS vs LM Studio).
+    """
+    d = read_arc_dat()
+    if not d:
+        return None
+    rndr = float(d.get('RNDR', 0) or 0)
+    comp = float(d.get('COMPUTE', 0) or 0)
+    # OVMS es la cifra buena; sólo se cae al pico de motores si el daemon es viejo
+    ovms = float(d['OVMS']) if 'OVMS' in d else max(rndr, comp)
+    return {
+        'gpu_busy': round(ovms, 1),
+        'gpu_power': 0,
+        'pkg_power': 0,
+        'render': round(rndr, 1),
+        'compute': round(comp, 1),
+    }
+
+
+def read_lm_gpu_stats():
+    """GPU que sirve LM Studio: Tesla V100 (backend CUDA de llama.cpp).
+
+    Comprobado en el log del servidor ("layer 3 is assigned to device CUDA0")
+    y con nvidia-smi: el modelo cargado no toca la iGPU Arc, así que el uso
+    sale de la V100, no de /tmp/conky_arc.dat.
+    """
+    try:
+        out = subprocess.run(
+            ['nvidia-smi', '-i', '0',
+             '--query-gpu=utilization.gpu,memory.used,memory.total,power.draw',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=3).stdout.strip()
+        util, used, total, pwr = [float(x) for x in out.split(',')]
+        return {'util': round(util, 0), 'vram_used': used / 1024.0,
+                'vram_total': total / 1024.0, 'pwr': round(pwr, 0)}
     except Exception:
-        pass
-    finally:
-        if p:
-            p.kill()
-            p.wait()
-    return None
-
-
-def intel_peak_sample(prev=None):
-    """intel_gpu_top da una foto instantanea y la inferencia es en rafagas:
-    muestrea varias veces dentro de la ventana y devuelve el pico observado."""
-    first = read_arc_sample()
-    peak = dict(first) if first else None
-    for _ in range(3):
-        time.sleep(INTERVAL / 10)
-        s = read_arc_gpu_stats()
-        if s and (peak is None or s.get('gpu_busy', 0) > peak.get('gpu_busy', 0)):
-            peak = s
-    return peak
-
-
-def read_arc_gpu_stats():
-    """Muestra corta (1 s) para el muestreo de pico."""
-    return read_intel_gpu_stats()
-
-
-def read_arc_sample():
-    return read_intel_gpu_stats()
+        return {'util': 0.0, 'vram_used': 0.0, 'vram_total': 0.0, 'pwr': 0.0}
 
 
 def model_disk_size_mb(name, _cache={}):
@@ -602,6 +658,10 @@ def build_dat(intel, lm, rpi5):
     lines.append(f"LM_LAST_AGE:{lm['last_age']}")
     lines.append(f"LM_TODAY_GENS:{lm['today_gens']}")
     lines.append(f"LM_TODAY_TOK:{lm['today_tok']}")
+    lines.append(f"LM_GPU:{lm.get('gpu_busy', 0.0):.0f}")
+    lines.append(f"LM_VRAM_USED:{lm.get('vram_used', 0.0):.1f}")
+    lines.append(f"LM_VRAM_TOTAL:{lm.get('vram_total', 0.0):.1f}")
+    lines.append(f"LM_PWR:{lm.get('pwr', 0.0):.0f}")
 
     # ---- Pi5 .80: llama.cpp Vulkan (RX 480 por PCIe)
     lines.append(f"RPI_STATE:{rpi5['state']}")
@@ -628,15 +688,32 @@ def build_dat(intel, lm, rpi5):
     lines.append(f"RPI_GPU_PWR:{int(gpu['power_w'])}")
     lines.append(f"RPI_GPU_PCI:{gpu['pci']}")
 
+    # ── Histórico de uso: se muestrea aquí y se emite como sparkline ──
+    igu = intel.get('gpu_usage') or {}
+    for key, val in (('INTEL_GPU_BUSY', igu.get('gpu_busy', 0)),
+                     ('LM_GPU', lm.get('gpu_busy', 0)),
+                     ('RPI_GPU_BUSY', gpu.get('busy', 0))):
+        hist_push(key, val)
+        top, bot = spark(key)
+        lines.append(f'{key}_SPARK_TOP:{top}')
+        lines.append(f'{key}_SPARK_BOT:{bot}')
+    hist_save()
+
     write_dat(lines)
 
 
 def main():
+    hist_load()
     while True:
         try:
             gpu = read_intel_gpu_stats()
             intel = collect_intel(gpu)
             lm = collect_lmstudio()
+            g = read_lm_gpu_stats()
+            lm['gpu_busy'] = g['util']
+            lm['vram_used'] = g['vram_used']
+            lm['vram_total'] = g['vram_total']
+            lm['pwr'] = g['pwr']
             rpi5 = collect_rpi5()
             build_dat(intel, lm, rpi5)
         except Exception:
