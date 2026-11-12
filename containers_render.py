@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Render para Conky: estado de los motores de inferencia locales
-(contenedor OpenVINO de Intel + llama.cpp Vulkan del Pi5 .80)."""
+(contenedor OpenVINO de Intel Arc + contenedor ninfer-serve en V100)."""
 import os
+import re
 
 DAT_FILE = '/tmp/conky_containers.dat'
 HELPER_DIR = os.path.expanduser('~/.config/conky/state')
@@ -90,8 +91,8 @@ def fmt_age(sec):
 def render():
     # Helpers siempre presentes: si faltan, Conky falla al evaluar execgraph
     write_helper('conky_intel_gpu_busy.sh', 'INTEL_GPU_BUSY')
-    write_helper('conky_lm_gpu.sh', 'LM_GPU')
-    write_helper('conky_rpi_gpu_busy.sh', 'RPI_GPU_BUSY')
+    write_helper('conky_ninfer_cpu.sh', 'NINFER_CPU')
+    write_helper('conky_ninfer_mem_used.sh', 'NINFER_MEM_USED')
 
     if not os.path.exists(DAT_FILE):
         print("${color4}${alignc}IA GPU${color}")
@@ -146,104 +147,45 @@ def render():
             if names:
                 print(f"${{color1}}Disponibles: ${{color}}{', '.join(names)}${{color}}")
 
-    # ══════════ LM Studio — Vulkan sobre la iGPU Arc ══════════
+    # ══════════ Ninfer — V100 :8090 ══════════
     print()
-    print("${color4}── LM Studio — CUDA · V100 :1234 ──${color}")
-    if data.get('LM_RUNNING', '0') != '1':
-        print("${color1}Estado: ${color3}sin respuesta${color}")
-        print("${color1}Servidor: ${color3}LM Studio cerrado${color}")
-    else:
-        n_load = int(data.get('LM_MODELS_LOADED', '0'))
-        n_tot = int(data.get('LM_MODELS_TOTAL', '0'))
-        gen = data.get('LM_GENERATING', '0') == '1'
-        st_col = 'color2' if gen else 'color1'
-        st_txt = 'generando' if gen else 'idle'
-        print(f"${{color1}}Estado: ${{{st_col}}}{st_txt}${{color}}  "
-              f"${{color1}}Modelos: ${{color2}}{n_load}/{n_tot}${{color}}")
-        if n_load == 0:
-            print("${color5}(Ningún modelo cargado)${color}")
-        for i in range(min(n_load, 2)):
-            name = data.get(f'LM_M{i}_NAME', '?')
-            short = name if len(name) <= 30 else name[:27] + '...'
-            quant = data.get(f'LM_M{i}_QUANT', '?')
-            ctx = int(float(data.get(f'LM_M{i}_CTX', '0')))
-            print(f"${{color2}}▶ {short}${{color}} ${{color1}}({quant}, "
-                  f"ctx {ctx//1024}k)${{color}}")
-            if i == 0:
-                if gen:
-                    pps = float(data.get('LM_PPS', '0'))
-                    extra = f" · prompt {pps:.0f} t/s" if pps > 0 else ''
-                    print(f"${{color1}}Gen: ${{color2}}{data.get('LM_TG', '0')} t/s"
-                          f"${{color}}{extra}${{color1}} · "
-                          f"${{color2}}{fmt_tok(data.get('LM_TOK', '0'))}${{color1}} tok${{color}}")
-                else:
-                    age = int(float(data.get('LM_LAST_AGE', '-1')))
-                    if age >= 0:
-                        print(f"${{color1}}Última: hace ${{color2}}{fmt_age(age)}${{color}}"
-                              f"${{color1}} · ${{color2}}{data.get('LM_LAST_TG', '0')} t/s${{color}}"
-                              f"${{color1}} · ${{color2}}{fmt_tok(data.get('LM_LAST_TOK', '0'))} tok${{color}}")
-                    else:
-                        print("${color5}(Sin generaciones registradas)${color}")
-        if n_load:
-            slots = data.get('LM_M0_SLOTS', '0')
-            queue = data.get('LM_M0_QUEUE', '0')
-            peso = float(data.get('LM_M0_SIZE', '0'))
-            print(f"${{color1}}Peso: ${{color2}}{peso:.1f} GB${{color}}  "
-                  f"${{color1}}Slots: ${{color2}}{slots}${{color}}  "
-                  f"${{color1}}Cola: ${{color2}}{queue}${{color}}")
-        print(f"${{color1}}Hoy: ${{color2}}{data.get('LM_TODAY_GENS', '0')}${{color}}"
-              f"${{color1}} gen · ${{color2}}"
-              f"{fmt_tok(data.get('LM_TODAY_TOK', '0'))}${{color}}"
-              f"${{color1}} tok${{color}}")
-        vram_u = float(data.get('LM_VRAM_USED', '0') or 0)
-        vram_t = float(data.get('LM_VRAM_TOTAL', '0') or 0)
-        extra = (f" · {data.get('LM_PWR', '0')} W" if vram_t else '')
-        if vram_t:
-            print(f"${{color1}}VRAM: ${{color2}}{vram_u:.0f}/{vram_t:.0f} GB${{color}}")
-        for line in gpu_panel(data, 'LM_GPU', 'Uso GPU V100:', extra):
-            print(line)
-
-    # ══════════ Pi5 .80 — llama.cpp Vulkan ══════════
-    print()
-    print("${color4}── Pi5 .80 — llama.cpp Vulkan ──${color}")
-    running = data.get('RPI_RUNNING', '0') == '1'
-    state = data.get('RPI_STATE', '?')
-    sc = 'color2' if running else 'color3'
-    print(f"${{color1}}Estado: ${{{sc}}}{state}${{color}}  ${{color1}}:1235${{color}}")
-    gpu_on = data.get('RPI_GPU_DRIVER', '') == 'amdgpu'
-    write_helper('conky_rpi5_bar.sh', 'RPI_GPU_BUSY' if gpu_on else 'RPI_KV')
-    write_helper('conky_rpi5_vram.sh', 'RPI_GPU_VRAMPCT')
+    print("${color4}── Ninfer — NVIDIA V100 ──${color}")
+    running = data.get('NINFER_RUNNING', '0') == '1'
     if not running:
-        http = data.get('RPI_HTTP', '000')
-        detail = 'proceso caído' if http == '000' else f'HTTP {http}'
-        print(f"${{color1}}Nodo: ${{color5}}192.168.0.80${{color}}  ${{color3}}{detail}${{color}}")
+        print(f"${{color3}}Estado: {data.get('NINFER_STATUS', 'unknown')}${{color}}")
+        print("${color1}:8090${color}  ${color3}DETENIDO${color}")
     else:
-        model = data.get('RPI_MODEL', '?')
-        quant = data.get('RPI_QUANT', '-')
-        ctx = data.get('RPI_CTX', '0')
+        cpu = float(data.get('NINFER_CPU', '0'))
+        mem_u = float(data.get('NINFER_MEM_USED', '0'))
+        mem_t = float(data.get('NINFER_MEM_TOTAL', '0'))
+        n_workers = int(data.get('NINFER_WORKERS', '0'))
+        kv_cache = float(data.get('NINFER_KV_CACHE_PCT', '0'))
+        total_vram = float(data.get('NINFER_VRAM_TOTAL', '0'))
+        used_vram = float(data.get('NINFER_VRAM_USED', '0'))
+        
+        # Estado general
+        status_text = data.get('NINFER_HEALTH', 'ready')
+        sc = 'color2' if status_text == 'ready' else 'color5'
+        print(f"${{color1}}Estado: ${{{sc}}}{status_text}${{color}}  ${{color1}}:8090${{color}}")
+        
+        # Modelo cargado y cuantos workers
+        model = data.get('NINFER_MODEL', '?')
+        quant = data.get('NINFER_QUANT', '?')
+        ctx = data.get('NINFER_CTX', '0')
         short = model if len(model) <= 30 else model[:27] + '...'
         print(f"${{color2}}▶ {short}${{color}} ${{color1}}({quant}, ctx {ctx})${{color}}")
-        print(f"${{color1}}Slots: ${{color2}}{data.get('RPI_SLOTS', '0/0')}${{color}}  "
-              f"${{color1}}KV: ${{color2}}{data.get('RPI_KV', '0')}%${{color}}")
-        if data.get('RPI_METRICS', '0') == '1':
-            print(f"${{color1}}Gen: ${{color2}}{data.get('RPI_TPS', '0')} t/s${{color}}  "
-                  f"${{color1}}Prompt: ${{color2}}{data.get('RPI_PPS', '0')} t/s${{color}}")
-            print(f"${{color1}}Peticiones: ${{color2}}{data.get('RPI_PROC', '0')}${{color}} ${{color1}}en curso, "
-                  f"${{color}}{data.get('RPI_DEFER', '0')}${{color}} ${{color1}}en cola${{color}}")
-    # La GPU se muestra siempre: sirve igual con llama.cpp parado
-    if gpu_on:
-        print(f"${{color1}}GPU RX 480: ${{color2}}{data.get('RPI_GPU_BUSY', '0')}%${{color}}  "
-              f"${{color1}}Temp: ${{color2}}{data.get('RPI_GPU_TEMP', '0')}°C${{color}}  "
-              f"${{color1}}VRAM: ${{color2}}{data.get('RPI_GPU_VRAMPCT', '0')}%${{color}}")
-        print(f"${{color1}}Frec: ${{color2}}{data.get('RPI_GPU_FREQ', '0')} MHz${{color}}  "
-              f"${{color1}}Pwr: ${{color2}}{data.get('RPI_GPU_PWR', '0')} W${{color}}  "
-              f"${{color5}}{data.get('RPI_GPU_PCI', 'none')}${{color}}")
-        for line in gpu_panel(data, 'RPI_GPU_BUSY', 'Uso GPU RX 480:', ''):
-            print(line)
-    else:
-        print("${color5}GPU: amdgpu ausente (llvmpipe)${color}")
-        for line in gpu_panel(data, 'RPI_GPU_BUSY', 'Uso GPU RX 480:', ''):
-            print(line)
+        print(f"${{color1}}Workers: ${{color2}}{n_workers}${{color}}  "
+              f"${{color1}}CPU: ${{color2}}{cpu}%${{color}}  "
+              f"${{color1}}RAM: ${{color2}}{mem_u/1024:.1f}/{mem_t/1024:.1f} GB${{color}}")
+        
+        # VRAM (de v100_stats.sh si está disponible)
+        if total_vram > 0:
+            print(f"${{color1}}VRAM: ${{color2}}{used_vram:.0f}/{total_vram:.0f} GB ({kv_cache:.0f}% KV cache)${{color}}")
+            for line in gpu_panel(data, 'LM_GPU', 'Uso GPU V100:', ''):
+                print(line)
+        else:
+            for line in gpu_panel(data, 'LM_GPU', 'Uso GPU V100:', ''):
+                print(line)
 
 if __name__ == '__main__':
     render()

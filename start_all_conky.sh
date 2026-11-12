@@ -47,7 +47,7 @@ echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-def
 # PRE-CREATE DAEMON DATA
 # ==============================================================================
 
-touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_nvme2tb_io.dat /tmp/conky_v100.dat 2>/dev/null || true
+touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_v100.dat 2>/dev/null || true
 
 # Los daemons de GPU (v100_stats.sh, rx480_stats.sh) se ejecutan como unidades
 # systemd --user (conky-v100-stats), igual que npu-daemon
@@ -69,18 +69,18 @@ if [ -x "$CONKY_DIR/fetch_containers_stats.py" ]; then
     echo "[$(date '+%H:%M:%S')] Started IA Containers stats daemon"
 fi
 
-# Start NVMe 2TB I/O daemon (feeds nvme2tb_read.sh / nvme2tb_write.sh)
-pkill -f 'nvme2tb_io_daemon\.sh' 2>/dev/null || true
-if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ]; then
-    setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 200>&- &
-    echo "[$(date '+%H:%M:%S')] Started NVMe 2TB I/O daemon"
+# Start Nous Portal stats daemon (feeds nous_pie_gen.py)
+pkill -f 'fetch_nous_stats\.py' 2>/dev/null || true
+if [ -x "$CONKY_DIR/fetch_nous_stats.py" ]; then
+    setsid "$CONKY_DIR/fetch_nous_stats.py" >> "$LOG_DIR/conky_nous_daemon.log" 2>&1 200>&- &
+    echo "[$(date '+%H:%M:%S')] Started Nous Portal stats daemon"
 fi
 
 # ==============================================================================
 # DEPENDENCIES CHECK
 # ==============================================================================
 
-# (Storage1TB ya no existe como dispositivo separado — el NVMe 1TB está en /)
+# (sin discos extra: el único disco es el SSD 1TB que es / )
 
 # ==============================================================================
 # CLEANUP OLD INSTANCES
@@ -102,6 +102,7 @@ declare -A CONKY_INSTANCES=(
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [openrouter]="$CONKY_DIR/conky_openrouter.conf"
     [ollama]="$CONKY_DIR/conky_ollama.conf"
+    [nous]="$CONKY_DIR/conky_nous.conf"
     [containers]="$CONKY_DIR/conky_containers.conf"
 )
 
@@ -148,8 +149,8 @@ echo "[$(date '+%H:%M:%S')] Watchdog started."
             setsid "$CONKY_DIR/fetch_containers_stats.py" >> "$LOG_DIR/conky_containers_daemon.log" 2>&1 200>&- &
         fi
 
-        if [ -x "$CONKY_DIR/nvme2tb_io_daemon.sh" ] && ! pgrep -f 'nvme2tb_io_daemon\.sh' >/dev/null 2>&1; then
-            setsid "$CONKY_DIR/nvme2tb_io_daemon.sh" >> "$LOG_DIR/conky_nvme2tb_daemon.log" 2>&1 200>&- &
+        if [ -x "$CONKY_DIR/fetch_nous_stats.py" ] && ! pgrep -f 'fetch_nous_stats\.py' >/dev/null 2>&1; then
+            setsid "$CONKY_DIR/fetch_nous_stats.py" >> "$LOG_DIR/conky_nous_daemon.log" 2>&1 200>&- &
         fi
 
         for name in "${!CONKY_INSTANCES[@]}"; do
