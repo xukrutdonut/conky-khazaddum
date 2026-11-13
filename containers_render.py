@@ -178,14 +178,13 @@ def render():
               f"${{color1}}CPU: ${{color2}}{cpu}%${{color}}  "
               f"${{color1}}RAM: ${{color2}}{mem_u/1024:.1f}/{mem_t/1024:.1f} GB${{color}}")
         
-        # VRAM (de v100_stats.sh si está disponible)
+        # VRAM + utilización GPU de v100_stats.sh
+        gpu_util = float(data.get('NINFER_GPU_UTIL', '0'))
+        gpu_temp = int(float(data.get('NINFER_GPU_TEMP', '0')))
         if total_vram > 0:
             print(f"${{color1}}VRAM: ${{color2}}{used_vram:.0f}/{total_vram:.0f} GB ({kv_cache:.0f}% KV cache)${{color}}")
-            for line in gpu_panel(data, 'LM_GPU', 'Uso GPU V100:', ''):
-                print(line)
-        else:
-            for line in gpu_panel(data, 'LM_GPU', 'Uso GPU V100:', ''):
-                print(line)
+        for line in gpu_panel(data, 'NINFER_GPU_UTIL', 'Uso GPU V100:', f' · {gpu_temp}°C'):
+            print(line)
 
 if __name__ == '__main__':
     render()
