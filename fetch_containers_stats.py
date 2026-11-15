@@ -96,8 +96,12 @@ def spark(key):
 
 
 def swap_row(key):
-    """Fila binaria de 46 cols: █ cargado en algún momento del tramo, ▁ no."""
-    return ''.join('█' if c >= 0.5 else '▁' for c in hist_cols(key))
+    """Fila de 46 cols: █ donde el modelo estuvo residente, vacío si no.
+
+    Se usa ESPACIO (no ▁) para 'descargado': ▁ pinta una rayita continua y el
+    carril vacío se leía como relleno.
+    """
+    return ''.join('█' if c >= 0.5 else ' ' for c in hist_cols(key))
 
 
 def swap_age_ev(key):

@@ -94,6 +94,7 @@ def swap_section(data):
     palette = ('color2', 'color1', 'color5', 'color4', 'color3')
     print()
     print("${color4}── Swap de carga · 15 min ──${color}")
+    print("${color2}█${color}${color1} residente en VRAM · vacío = no  |  -15 min → ahora${color}")
     last_eng = None
     k = 0
     actual = None
@@ -149,9 +150,12 @@ def render():
     data = {}
     with open(DAT_FILE) as f:
         for line in f:
-            line = line.strip()
+            line = line.rstrip('\n')
             if not line or ':' not in line:
                 continue
+            # NO rstrip completo: los espacios de los carriles SWAP*_ROW son
+            # padding izquierdo (modelo no residente al inicio de la ventana)
+            # y perderlos correría el tramo pintado hacia la izquierda.
             k, v = line.split(':', 1)
             data[k] = v
 
