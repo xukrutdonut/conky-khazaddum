@@ -3,6 +3,7 @@
 (contenedor OpenVINO de Intel Arc + contenedor ninfer-serve en V100)."""
 import os
 import re
+import time
 
 DAT_FILE = '/tmp/conky_containers.dat'
 HELPER_DIR = os.path.expanduser('~/.config/conky/state')
@@ -72,52 +73,60 @@ def fmt_tok(n):
     return str(n)
 
 
-def swap_section(data):
-    """Carriles de swap de carga: una fila por modelo, █ residente · no.
+def fmt_dur(sec):
+    sec = int(float(sec))
+    if sec >= 90:
+        return f'{sec // 60}m {sec % 60:02d}s'
+    return f'{sec}s'
 
-    El daemon muestrea cada 5 s y agrega por OR a 46 columnas (15 min). Como el
-    router ninfer solo puede tener 1 modelo en VRAM, los carriles se ven como un
-    rio de swaps: al llenarse uno se vacia el anterior. OVMS es eager, su tramo
-    solo se mueve si ovms-model enciende/apaga modelos.
-    """
+
+def carga_section(data):
+    """Por modelo: estado (carga activa / cargado / descargado) y duracion de
+    su ultima carga. La duracion real la da serve.log de ninfer
+    ("engine ready | ... | total 1m 24.1s"), no el muestreo de 5 s."""
     try:
-        n = int(data.get('SWAP_COUNT', '0') or 0)
+        n = int(data.get('LOAD_COUNT', '0') or 0)
     except ValueError:
         return
     if not n:
         return
-    palette = ('color2', 'color1', 'color5', 'color4', 'color3')
     print()
-    print("${color4}── Swap de carga · 15 min ──${color}")
-    print("${color2}█${color}${color1} residente en VRAM · vacío = no  |  -15 min → ahora${color}")
-    last_eng = None
-    k = 0
-    actual = None
+    print("${color4}── Carga de modelos · V100 ──${color}")
+    any_loading = False
     for i in range(n):
-        eng = data.get(f'SWAP{i}_ENG', '')
-        name = data.get(f'SWAP{i}_NAME', '?')
-        row = data.get(f'SWAP{i}_ROW', '')
-        now = data.get(f'SWAP{i}_NOW', '0') == '1'
+        name = data.get(f'LOAD{i}_NAME', '?')
+        st = data.get(f'LOAD{i}_STATE', 'unloaded')
+        dur = data.get(f'LOAD{i}_DUR', '')
+        ago = data.get(f'LOAD{i}_AGO', '')
+        elap = data.get(f'LOAD{i}_ELAP', '')
+        if st == 'loaded':
+            tag = "${color2}CARGADO${color}"
+        elif st == 'loading':
+            extra = f" {fmt_age(elap)}…" if elap else "…"
+            tag = f"${{color5}}CARGANDO{extra}${{color}}"
+            any_loading = True
+        else:
+            tag = "${color}descargado${color}"
+        line = f"{name:<16}{tag}"
+        if dur:
+            line += f"${{color1}} · última carga:${{color}} ${{color2}}{fmt_dur(dur)}${{color}}"
+            if ago:
+                line += f" ${{color1}}(hace {fmt_age(ago)})${{color}}"
+        print(line)
+    ep = data.get('LOAD_EP', '')
+    if ep and not any_loading:
+        parts = ep.split('|')
         try:
-            age = int(float(data.get(f'SWAP{i}_AGE', '0') or 0))
-            ev = int(float(data.get(f'SWAP{i}_EV', '0') or 0))
-        except ValueError:
-            age, ev = 0, 0
-        if eng != last_eng:
-            tag = 'OVMS — Arc · eager' if eng == 'OVMS' else 'Ninfer — V100 · 1 en VRAM'
-            print(f"${{color1}}{tag}${{color}}")
-            last_eng = eng
-            k = 0
-        c = palette[k % len(palette)]
-        k += 1
-        short = name if len(name) <= 14 else name[:14].rstrip('-._')
-        mark = '▶' if now else '·'
-        print(f"{short:<14}${{{c}}}{mark}{row}${{color}}")
-        if eng == 'NINFER' and now:
-            actual = (short, c, age, ev)
-    if actual:
-        short, c, age, ev = actual
-        print(f"${{color1}}En VRAM: ${{{c}}}{short}${{color}} · {fmt_age(age)} · {ev} carga(s)/15m${{color}}")
+            alive = (time.time() - float(parts[0])) < 120
+        except (ValueError, IndexError):
+            alive = False
+        if alive:
+            bits = []
+            if len(parts) > 1 and parts[1]:
+                bits.append(f"{float(parts[1]):.0f}%")
+            if len(parts) > 2 and parts[2]:
+                bits.append(f"ETA {fmt_dur(parts[2])}")
+            print(f"${{color5}}swap en curso${{color}} · ${{color1}}{' · '.join(bits)}${{color}}")
 
 
 def fmt_age(sec):
@@ -232,7 +241,7 @@ def render():
         for line in gpu_panel(data, 'NINFER_GPU_UTIL', 'Uso GPU V100:', f' · {gpu_temp}°C'):
             print(line)
 
-    swap_section(data)
+    carga_section(data)
 
 if __name__ == '__main__':
     render()

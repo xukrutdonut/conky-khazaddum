@@ -24,25 +24,28 @@ HIST_FILE = '/tmp/conky_gpu_hist.json'
 HIST_MAX = 180
 SPARK_W = 46          # 46 x 5.42 px = 249 px + etiqueta <=14 = 325 px < 344 utiles
 _SPARK_BLOCKS = '▁▂▃▄▅▆▇█'
-_SWAP_MAX_ENG = 8     # carriles maximos por motor
-_hist = {}
-_swapreg = {}
+_hist = {}            # series 0-100 de uso GPU (para la sparkline)
+_loads = {}           # id -> (duracion ultimo 'engine ready' en s, ts de fin)
+_load_seen = {}       # id -> ts en que el panel vio 'loading' por primera vez
 
 
 def hist_load():
-    global _hist, _swapreg
+    global _hist, _loads
     try:
         with open(HIST_FILE) as f:
             d = json.load(f)
-        _swapreg = {k: [str(x) for x in v] for k, v in (d.get('__reg__') or {}).items()}
-        _hist = {k: [float(x) for x in v][-HIST_MAX:] for k, v in d.items() if k != '__reg__'}
+        _loads = {k: (float(v[0]), float(v[1])) for k, v in (d.get('__loads__') or {}).items()}
+        # se descartan las series SWAP:: antiguas (carriles de tiempo)
+        _hist = {k: [float(x) for x in v][-HIST_MAX:]
+                 for k, v in d.items()
+                 if not k.startswith('__') and not k.startswith('SWAP::')}
     except Exception:
-        _hist, _swapreg = {}, {}
+        _hist, _loads = {}, {}
 
 
 def hist_save():
     try:
-        out = {**_hist, '__reg__': {k: list(v) for k, v in _swapreg.items()}}
+        out = {**_hist, '__loads__': {k: [v[0], v[1]] for k, v in _loads.items()}}
         tmp = HIST_FILE + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(out, f)
@@ -83,59 +86,117 @@ def spark(key):
     return ''.join(out)
 
 
-def swap_row(key):
-    """Fila de 46 cols: █ donde el modelo estuvo residente, vacío si no.
+def parse_dur(txt):
+    """'1m 24.1s' | '50.2s' | '710 ms' | '30m 23.8s' -> segundos."""
+    total = 0.0
+    for val, unit in re.findall(r'([\d.]+)\s*(ms|m|s)', txt):
+        v = float(val)
+        total += v / 1000.0 if unit == 'ms' else (v * 60.0 if unit == 'm' else v)
+    return total
 
-    Se usa ESPACIO (no ▁) para 'descargado': ▁ pinta una rayita continua y el
-    carril vacío se leía como relleno.
+
+def log_ts(line):
+    m = re.match(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)', line)
+    if not m:
+        return 0.0
+    try:
+        return time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+    except Exception:
+        return 0.0
+
+
+def parse_ninfer_log():
+    """Cola de serve.log: (ultimo evento engine-ready, episodio de carga abierto).
+
+    Evento = (ts_fin, dur_s) de "engine ready | NAME | total 1m 24.1s".
+    Episodio = (ts_inicio, pct|None, ts_ultimo, eta_s|None) mientras haya lineas
+    "loading weights" posteriores al ultimo evento. serve.log nombra el ARTEFACTO
+    (qwen3.8-35b-a3b-distill), no el id del router (qwen3.8-35b-a3b), asi que el
+    evento se atribuye al id que /v1/models reporte cargado en el ciclo siguiente
+    — con models-max 1 hay exactamente uno.
     """
-    return ''.join('█' if c >= 0.5 else ' ' for c in hist_cols(key))
+    try:
+        r = subprocess.run(
+            ['docker', 'exec', 'ninfer-serve', 'tail', '-c', '262144', '/tmp/serve.log'],
+            capture_output=True, text=True, timeout=8)
+        text = r.stdout or ''
+    except Exception:
+        return None, None
+    ready = None
+    ep_start = ep_last = 0.0
+    ep_pct = ep_eta = None
+    for line in text.splitlines():
+        ts = log_ts(line)
+        if not ts:
+            continue
+        if 'engine ready' in line and ' | ' in line:
+            m = re.search(r'total (.+?)\s*(?:\||$)', line)
+            if m:
+                ready = (ts, parse_dur(m.group(1)))
+            ep_start = ep_last = 0.0
+            ep_pct = ep_eta = None
+        elif re.search(r'INFO\s+loading weights \|', line):
+            ep_start = ep_start or ts
+            ep_last = ts
+        elif re.search(r'INFO\s+loading weights \d', line):
+            m = re.search(r'loading weights ([\d.]+)%.*ETA (.+?)\s*(?:\||$)', line)
+            if m:
+                ep_pct = float(m.group(1))
+                ep_eta = parse_dur(m.group(2))
+            ep_start = ep_start or ts
+            ep_last = ts
+    ep = (ep_start, ep_pct, ep_last, ep_eta) if ep_start else None
+    return ready, ep
 
 
-def swap_age_ev(key):
-    """Segundos en el estado actual y nº de cargas (0->1) dentro de la ventana."""
-    h = _hist.get(key) or []
-    if not h:
-        return 0, 0
-    now = 1 if h[-1] >= 0.5 else 0
-    age = 0
-    for v in reversed(h):
-        if (1 if v >= 0.5 else 0) == now:
-            age += 1
+def emit_loads(lines, ninfer):
+    """LOAD*: estado por modelo + duracion de su ultima carga + swap en curso.
+
+    STATE: loaded (residente) | loading (la API reporta carga en marcha) |
+    unloaded. DUR/AGO salen del evento 'engine ready' atribuido al id que se
+    quedo cargado. Si ningun id dice 'loading' pero el episodio de serve.log
+    sigue vivo, el render pinta una linea generica "swap en curso" con pct/ETA.
+    """
+    states = ninfer.get('swap') or []
+    ready, ep = parse_ninfer_log()
+    now = time.time()
+    loaded_ids = [name for name, val in states
+                  if val in ('loaded', 'ready', 'running')]
+    if ready and ready[0] > 0 and loaded_ids:
+        seen = max([ts for _d, ts in _loads.values()] or [0.0])
+        if ready[0] > seen:
+            for name in loaded_ids:
+                _loads[name] = ready
+    if ep and ready and ep[0] < ready[0]:
+        ep = None
+    lines.append(f'LOAD_COUNT:{len(states)}')
+    for i, (name, val) in enumerate(states):
+        if val in ('loaded', 'ready', 'running'):
+            st = 'loaded'
+        elif val in ('loading', 'starting', 'pending', 'warming', 'sync'):
+            st = 'loading'
         else:
-            break
-    ev = sum(1 for a, b in zip(h, h[1:]) if a < 0.5 <= b)
-    return age * INTERVAL, ev
-
-
-def emit_swap(lines, intel, ninfer):
-    """Carriles SWAP<i>_*: histérico 0/1 de 'modelo residente en VRAM' por modelo.
-
-    OVMS: cargado == presente en /v1/config (eager, solo cambia con ovms-model).
-    Ninfer: status.value loaded/ready/running de /v1/models (router models-max 1).
-    Si la API del motor no responde el ciclo, todo su registro cuenta como 0: el
-    carril no desaparece, se ve descargado.
-    """
-    idx = 0
-    for eng, states in (('OVMS', intel.get('swap') or []), ('NINFER', ninfer.get('swap') or [])):
-        reg = _swapreg.setdefault(eng, [])
-        cur = dict(states)
-        for name, _s in states:
-            if name not in reg:
-                reg.append(name)
-        del reg[_SWAP_MAX_ENG:]
-        for name in reg:
-            hkey = f'SWAP::{eng}::{name}'
-            hist_push(hkey, 1 if cur.get(name) else 0)
-            age, ev = swap_age_ev(hkey)
-            lines.append(f'SWAP{idx}_ENG:{eng}')
-            lines.append(f'SWAP{idx}_NAME:{name}')
-            lines.append(f'SWAP{idx}_ROW:{swap_row(hkey)}')
-            lines.append(f'SWAP{idx}_NOW:{"1" if cur.get(name) else "0"}')
-            lines.append(f'SWAP{idx}_AGE:{age}')
-            lines.append(f'SWAP{idx}_EV:{ev}')
-            idx += 1
-    lines.append(f'SWAP_COUNT:{idx}')
+            st = 'unloaded'
+        dur = ago = elap = ''
+        if st == 'loading':
+            # serve.log escribe con buffer: durante la carga puede no haber
+            # lineas nuevas aun, asi que el cronometro lo lleva el daemon.
+            t = _load_seen.setdefault(name, now)
+            elap = f'{max(0.0, now - t):.0f}'
+        else:
+            _load_seen.pop(name, None)
+        if name in _loads:
+            d, ts = _loads[name]
+            dur, ago = f'{d:.1f}', f'{max(0.0, now - ts):.0f}'
+        lines.append(f'LOAD{i}_NAME:{name}')
+        lines.append(f'LOAD{i}_STATE:{st}')
+        lines.append(f'LOAD{i}_DUR:{dur}')
+        lines.append(f'LOAD{i}_AGO:{ago}')
+        lines.append(f'LOAD{i}_ELAP:{elap}')
+    if ep and (now - ep[2]) < 120:
+        _start, pct, last, eta = ep
+        lines.append(f'LOAD_EP:{last:.0f}|{"" if pct is None else pct}|{"" if eta is None else f"{eta:.0f}"}')
+    hist_save()
 
 
 def gpu_hist(lines, intel, ninfer):
@@ -360,7 +421,7 @@ def collect_ninfer():
             for entry in data:
                 if isinstance(entry, dict) and entry.get('id'):
                     val = (entry.get('status') or {}).get('value')
-                    swap_list.append((entry['id'], 1 if val in ('loaded', 'ready', 'running') else 0))
+                    swap_list.append((entry['id'], str((entry.get('status') or {}).get('value') or 'unloaded')))
             chosen = None
             # 1) preferir el que esté realmente cargado (loaded/ready/running)
             for entry in data:
@@ -471,7 +532,7 @@ def build_dat(intel, ninfer):
     lines.append(f"NINFER_GPU_TEMP:{ninfer.get('gpu_temp', 0)}")
 
     gpu_hist(lines, intel, ninfer)
-    emit_swap(lines, intel, ninfer)
+    emit_loads(lines, ninfer)
 
     write_dat(lines)
 
