@@ -46,24 +46,19 @@ def bar(path, h=6):
 
 
 def gpu_panel(data, key, label, extra=''):
-    """Par de gráficas idéntico en los tres motores: barra instantánea + histórico.
+    """Barra instantánea + histórico en UNA sola fila, color fijo.
 
-    La barra (8 px) es el valor de este ciclo; el histórico son 2 filas de bloques
-    (17 niveles, 46 columnas = 15 min) que mantiene el daemon en
-    /tmp/conky_gpu_hist.json, así que no se vacía al reiniciar Conky como el
-    buffer interno de execgraph.
+    Sin umbrales de color rojo/amarillo ni etiqueta % extra: el usuario pidió
+    una única gráfica de uso limpia (2026-11-15). El histórico son 46 columnas
+    (15 min) que mantiene el daemon en /tmp/conky_gpu_hist.json, así que no se
+    vacía al reiniciar Conky como el buffer interno de execgraph.
     """
     path = write_helper(f'conky_{key.lower()}.sh', key)
     val = data.get(key, '0')
     lines = [f"${{color1}}{label} ${{color2}}{val}%${{color}}{extra}"]
     lines.append(f"${{color2}}{bar(path, 8)}${{color}}")
-    top = data.get(key + '_SPARK_TOP', '')
-    bot = data.get(key + '_SPARK_BOT', '')
-    if top or bot:
-        lines.append(top)
-        lines.append(bot)
-    else:
-        lines.append('${color}sin histórico')
+    row = data.get(key + '_SPARK', '')
+    lines.append(f"${{color2}}{row}${{color}}" if row else '${color}sin histórico')
     return lines
 
 

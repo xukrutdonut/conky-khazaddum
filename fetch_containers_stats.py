@@ -75,24 +75,12 @@ def hist_cols(key):
 
 
 def spark(key):
-    """Histórico de 2 filas de bloques (17 niveles) con color por nivel."""
-    top, bot = [], []
-    ctop = cbot = None
+    """Histórico en UNA fila de 8 niveles, color fijo (sin umbrales rojo/amarillo)."""
+    out = []
     for v in hist_cols(key):
         v = max(0.0, min(100.0, v))
-        lvl = int(round(v / 100.0 * 16))
-        col = '${color3}' if v >= 85 else ('${color4}' if v >= 60 else '${color2}')
-        if col != ctop:
-            top.append(col)
-            ctop = col
-        if col != cbot:
-            bot.append(col)
-            cbot = col
-        top.append(' ' if lvl <= 8 else _SPARK_BLOCKS[lvl - 9])
-        bot.append('█' if lvl >= 8 else _SPARK_BLOCKS[lvl])
-    top.append('${color}')
-    bot.append('${color}')
-    return ''.join(top), ''.join(bot)
+        out.append(_SPARK_BLOCKS[int(round(v / 100.0 * 7))])
+    return ''.join(out)
 
 
 def swap_row(key):
@@ -156,9 +144,7 @@ def gpu_hist(lines, intel, ninfer):
     hist_push('INTEL_GPU_BUSY', float(gu.get('gpu_busy', 0) or 0))
     hist_push('NINFER_GPU_UTIL', float(ninfer.get('gpu_util', 0) or 0))
     for key in ('INTEL_GPU_BUSY', 'NINFER_GPU_UTIL'):
-        top, bot = spark(key)
-        lines.append(f'{key}_SPARK_TOP:{top}')
-        lines.append(f'{key}_SPARK_BOT:{bot}')
+        lines.append(f'{key}_SPARK:{spark(key)}')
     hist_save()
 
 
