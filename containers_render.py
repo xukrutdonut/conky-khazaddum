@@ -77,6 +77,53 @@ def fmt_tok(n):
     return str(n)
 
 
+def swap_section(data):
+    """Carriles de swap de carga: una fila por modelo, █ residente · no.
+
+    El daemon muestrea cada 5 s y agrega por OR a 46 columnas (15 min). Como el
+    router ninfer solo puede tener 1 modelo en VRAM, los carriles se ven como un
+    rio de swaps: al llenarse uno se vacia el anterior. OVMS es eager, su tramo
+    solo se mueve si ovms-model enciende/apaga modelos.
+    """
+    try:
+        n = int(data.get('SWAP_COUNT', '0') or 0)
+    except ValueError:
+        return
+    if not n:
+        return
+    palette = ('color2', 'color1', 'color5', 'color4', 'color3')
+    print()
+    print("${color4}── Swap de carga · 15 min ──${color}")
+    last_eng = None
+    k = 0
+    actual = None
+    for i in range(n):
+        eng = data.get(f'SWAP{i}_ENG', '')
+        name = data.get(f'SWAP{i}_NAME', '?')
+        row = data.get(f'SWAP{i}_ROW', '')
+        now = data.get(f'SWAP{i}_NOW', '0') == '1'
+        try:
+            age = int(float(data.get(f'SWAP{i}_AGE', '0') or 0))
+            ev = int(float(data.get(f'SWAP{i}_EV', '0') or 0))
+        except ValueError:
+            age, ev = 0, 0
+        if eng != last_eng:
+            tag = 'OVMS — Arc · eager' if eng == 'OVMS' else 'Ninfer — V100 · 1 en VRAM'
+            print(f"${{color1}}{tag}${{color}}")
+            last_eng = eng
+            k = 0
+        c = palette[k % len(palette)]
+        k += 1
+        short = name if len(name) <= 14 else name[:14].rstrip('-._')
+        mark = '▶' if now else '·'
+        print(f"{short:<14}${{{c}}}{mark}{row}${{color}}")
+        if eng == 'NINFER' and now:
+            actual = (short, c, age, ev)
+    if actual:
+        short, c, age, ev = actual
+        print(f"${{color1}}En VRAM: ${{{c}}}{short}${{color}} · {fmt_age(age)} · {ev} carga(s)/15m${{color}}")
+
+
 def fmt_age(sec):
     sec = int(sec)
     if sec < 0:
@@ -185,6 +232,8 @@ def render():
             print(f"${{color1}}VRAM: ${{color2}}{used_vram:.0f}/{total_vram:.0f} GB ({kv_cache:.0f}% KV cache)${{color}}")
         for line in gpu_panel(data, 'NINFER_GPU_UTIL', 'Uso GPU V100:', f' · {gpu_temp}°C'):
             print(line)
+
+    swap_section(data)
 
 if __name__ == '__main__':
     render()

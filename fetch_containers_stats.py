@@ -15,6 +15,148 @@ INTERVAL = 5          # poll cada 5s
 INTEL_PORT = 8006
 NINFER_NAME = 'ninfer-serve'
 
+# --- histórico persistido (revive del commit c61f97c; se perdió en a90bd83) ---
+# 180 muestras x 5 s = 15 min; se agrega por máximos a SPARK_W columnas para que
+# los picos no se pierdan. Persiste en disco para no vaciarse al reiniciar el
+# daemon, y además guarda el registro de modelos (__reg__) para que los carriles
+# de swap no cambien de orden/identidad si la API falla un ciclo.
+HIST_FILE = '/tmp/conky_gpu_hist.json'
+HIST_MAX = 180
+SPARK_W = 46          # 46 x 5.42 px = 249 px + etiqueta <=14 = 325 px < 344 utiles
+_SPARK_BLOCKS = '▁▂▃▄▅▆▇█'
+_SWAP_MAX_ENG = 8     # carriles maximos por motor
+_hist = {}
+_swapreg = {}
+
+
+def hist_load():
+    global _hist, _swapreg
+    try:
+        with open(HIST_FILE) as f:
+            d = json.load(f)
+        _swapreg = {k: [str(x) for x in v] for k, v in (d.get('__reg__') or {}).items()}
+        _hist = {k: [float(x) for x in v][-HIST_MAX:] for k, v in d.items() if k != '__reg__'}
+    except Exception:
+        _hist, _swapreg = {}, {}
+
+
+def hist_save():
+    try:
+        out = {**_hist, '__reg__': {k: list(v) for k, v in _swapreg.items()}}
+        tmp = HIST_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(out, f)
+        os.replace(tmp, HIST_FILE)
+    except Exception:
+        pass
+
+
+def hist_push(key, val):
+    try:
+        v = max(0.0, min(100.0, float(val)))
+    except Exception:
+        v = 0.0
+    h = _hist.setdefault(key, [])
+    h.append(v)
+    del h[:-HIST_MAX]
+
+
+def hist_cols(key):
+    """Columnas del histórico: SPARK_W valores 0-100 (max de cada tramo)."""
+    h = _hist.get(key) or [0.0]
+    n = len(h)
+    cols = []
+    for i in range(SPARK_W):
+        a = int(i * n / SPARK_W)
+        b = max(a + 1, int((i + 1) * n / SPARK_W))
+        cols.append(max(h[a:b] or [0.0]))
+    # pad de ceros a la izquierda para que el ancho sea constante
+    return [0.0] * (SPARK_W - len(cols)) + cols
+
+
+def spark(key):
+    """Histórico de 2 filas de bloques (17 niveles) con color por nivel."""
+    top, bot = [], []
+    ctop = cbot = None
+    for v in hist_cols(key):
+        v = max(0.0, min(100.0, v))
+        lvl = int(round(v / 100.0 * 16))
+        col = '${color3}' if v >= 85 else ('${color4}' if v >= 60 else '${color2}')
+        if col != ctop:
+            top.append(col)
+            ctop = col
+        if col != cbot:
+            bot.append(col)
+            cbot = col
+        top.append(' ' if lvl <= 8 else _SPARK_BLOCKS[lvl - 9])
+        bot.append('█' if lvl >= 8 else _SPARK_BLOCKS[lvl])
+    top.append('${color}')
+    bot.append('${color}')
+    return ''.join(top), ''.join(bot)
+
+
+def swap_row(key):
+    """Fila binaria de 46 cols: █ cargado en algún momento del tramo, ▁ no."""
+    return ''.join('█' if c >= 0.5 else '▁' for c in hist_cols(key))
+
+
+def swap_age_ev(key):
+    """Segundos en el estado actual y nº de cargas (0->1) dentro de la ventana."""
+    h = _hist.get(key) or []
+    if not h:
+        return 0, 0
+    now = 1 if h[-1] >= 0.5 else 0
+    age = 0
+    for v in reversed(h):
+        if (1 if v >= 0.5 else 0) == now:
+            age += 1
+        else:
+            break
+    ev = sum(1 for a, b in zip(h, h[1:]) if a < 0.5 <= b)
+    return age * INTERVAL, ev
+
+
+def emit_swap(lines, intel, ninfer):
+    """Carriles SWAP<i>_*: histérico 0/1 de 'modelo residente en VRAM' por modelo.
+
+    OVMS: cargado == presente en /v1/config (eager, solo cambia con ovms-model).
+    Ninfer: status.value loaded/ready/running de /v1/models (router models-max 1).
+    Si la API del motor no responde el ciclo, todo su registro cuenta como 0: el
+    carril no desaparece, se ve descargado.
+    """
+    idx = 0
+    for eng, states in (('OVMS', intel.get('swap') or []), ('NINFER', ninfer.get('swap') or [])):
+        reg = _swapreg.setdefault(eng, [])
+        cur = dict(states)
+        for name, _s in states:
+            if name not in reg:
+                reg.append(name)
+        del reg[_SWAP_MAX_ENG:]
+        for name in reg:
+            hkey = f'SWAP::{eng}::{name}'
+            hist_push(hkey, 1 if cur.get(name) else 0)
+            age, ev = swap_age_ev(hkey)
+            lines.append(f'SWAP{idx}_ENG:{eng}')
+            lines.append(f'SWAP{idx}_NAME:{name}')
+            lines.append(f'SWAP{idx}_ROW:{swap_row(hkey)}')
+            lines.append(f'SWAP{idx}_NOW:{"1" if cur.get(name) else "0"}')
+            lines.append(f'SWAP{idx}_AGE:{age}')
+            lines.append(f'SWAP{idx}_EV:{ev}')
+            idx += 1
+    lines.append(f'SWAP_COUNT:{idx}')
+
+
+def gpu_hist(lines, intel, ninfer):
+    """Empuja el histórico de uso GPU y añade las filas SPARK que lee el render."""
+    gu = intel.get('gpu_usage') or {}
+    hist_push('INTEL_GPU_BUSY', float(gu.get('gpu_busy', 0) or 0))
+    hist_push('NINFER_GPU_UTIL', float(ninfer.get('gpu_util', 0) or 0))
+    for key in ('INTEL_GPU_BUSY', 'NINFER_GPU_UTIL'):
+        top, bot = spark(key)
+        lines.append(f'{key}_SPARK_TOP:{top}')
+        lines.append(f'{key}_SPARK_BOT:{bot}')
+    hist_save()
+
 
 def write_dat(lines):
     try:
@@ -194,7 +336,7 @@ def collect_ninfer():
         return {'running': False, 'status': status, 'cpu': 0.0, 'mem_used': 0.0, 'mem_total': 0.0,
                 'workers': 0, 'kv_cache_pct': 0.0, 'vram_used': 0.0, 'vram_total': 0.0,
                 'gpu_util': 0.0, 'gpu_temp': 0.0,
-                'model': '', 'quant': '', 'ctx': ''}
+                'model': '', 'quant': '', 'ctx': '', 'swap': []}
     # Fixed braces in f-string: use {{ to get a literal { in f-string
     cmd = f'docker stats {NINFER_NAME} --no-stream --format "{{{{.CPUPerc}}|{{{{.MemUsage}}}}}}" '
     r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=5)
@@ -219,10 +361,16 @@ def collect_ninfer():
     model = ''
     quant = ''
     ctx = ''
+    swap_list = []
     try:
         cfg = http_get_json('http://127.0.0.1:8090/v1/models')
         if isinstance(cfg, dict):
             data = cfg.get('data') or []
+            # estado por modelo (orden del router) para los carriles de swap
+            for entry in data:
+                if isinstance(entry, dict) and entry.get('id'):
+                    val = (entry.get('status') or {}).get('value')
+                    swap_list.append((entry['id'], 1 if val in ('loaded', 'ready', 'running') else 0))
             chosen = None
             # 1) preferir el que esté realmente cargado (loaded/ready/running)
             for entry in data:
@@ -258,14 +406,14 @@ def collect_ninfer():
         'running': True, 'status': status, 'cpu': cpu, 'mem_used': mem_u, 'mem_total': mem_t,
         'workers': workers, 'kv_cache_pct': kv_pct, 'vram_used': vram_used, 'vram_total': vram_total,
         'gpu_util': v100_util, 'gpu_temp': v100_temp,
-        'model': model, 'quant': quant, 'ctx': ctx
+        'model': model, 'quant': quant, 'ctx': ctx, 'swap': swap_list
     }
 
 
 def collect_intel():
     running, status = docker_status('ia-gpu-intel-openvino')
     if not running:
-        return {'running': False, 'status': status, 'models': [], 'gpu': {}, 'gpu_usage': None}
+        return {'running': False, 'status': status, 'models': [], 'gpu': {}, 'gpu_usage': None, 'swap': []}
     ready = port_open(INTEL_PORT)
     config = http_get_json(f'http://127.0.0.1:{INTEL_PORT}/v1/config')
     loaded_models = []
@@ -283,7 +431,8 @@ def collect_intel():
         gpu['gpu_process_memory_mb'] = float(arc.get('GTT', '0')) * 1024
     return {'running': True, 'status': status, 'health': 'ready' if ready else 'starting',
             'models': all_models, 'loaded_models': loaded_models,
-            'gpu': gpu, 'gpu_usage': arc}
+            'gpu': gpu, 'gpu_usage': arc,
+            'swap': [(m['name'], 1) for m in loaded_models]}
 
 
 def build_dat(intel, ninfer):
@@ -331,10 +480,14 @@ def build_dat(intel, ninfer):
     lines.append(f"NINFER_GPU_UTIL:{ninfer.get('gpu_util', 0)}")
     lines.append(f"NINFER_GPU_TEMP:{ninfer.get('gpu_temp', 0)}")
 
+    gpu_hist(lines, intel, ninfer)
+    emit_swap(lines, intel, ninfer)
+
     write_dat(lines)
 
 
 def main():
+    hist_load()
     while True:
         try:
             intel = collect_intel()
