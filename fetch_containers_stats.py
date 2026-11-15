@@ -3,6 +3,7 @@
 Monitoriza el uso de GPU para Intel y el contenedor ninfer-serve para el V100.
 Escribe /tmp/conky_containers.dat para que containers_render.py lo lea.
 """
+import calendar
 import json
 import os
 import subprocess
@@ -100,7 +101,8 @@ def log_ts(line):
     if not m:
         return 0.0
     try:
-        return time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+        # serve.log del contenedor ninfer escribe en UTC (host en CET):
+        return calendar.timegm(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
     except Exception:
         return 0.0
 
@@ -131,8 +133,9 @@ def parse_ninfer_log():
             continue
         if 'engine ready' in line and ' | ' in line:
             m = re.search(r'total (.+?)\s*(?:\||$)', line)
+            nm = re.search(r'engine ready \| ([^|]+?)\s*\|', line)
             if m:
-                ready = (ts, parse_dur(m.group(1)))
+                ready = (ts, parse_dur(m.group(1)), (nm.group(1).strip() if nm else ''))
             ep_start = ep_last = 0.0
             ep_pct = ep_eta = None
         elif re.search(r'INFO\s+loading weights \|', line):
@@ -165,8 +168,24 @@ def emit_loads(lines, ninfer):
     if ready and ready[0] > 0 and loaded_ids:
         seen = max([ts for _d, ts in _loads.values()] or [0.0])
         if ready[0] > seen:
-            for name in loaded_ids:
-                _loads[name] = ready
+            # atribuir AL id cuyo prefijo alfabetico coincida con el nombre del
+            # artefacto ('Gemma-4-26B...' -> gemma-4; 'qwen38-...' -> qwen3.8-...);
+            # si no coincide ninguno y solo hay un cargado, ese es.
+            def alpha(word):
+                return ''.join(re.findall(r'[a-z]+', word.lower())[:1])
+            name_ev = ready[2] if len(ready) > 2 else ''
+            pa = alpha(name_ev)
+            target = None
+            if pa:
+                cand = [i for i in loaded_ids if alpha(i) == pa]
+                if len(cand) == 1:
+                    target = cand
+            elif len(loaded_ids) == 1:
+                target = loaded_ids
+            if target:
+                for name in target:
+                    _loads[name] = (ready[1], ready[0])   # (duracion, ts_fin)
+                    _load_seen.pop(name, None)
     if ep and ready and ep[0] < ready[0]:
         ep = None
     lines.append(f'LOAD_COUNT:{len(states)}')
