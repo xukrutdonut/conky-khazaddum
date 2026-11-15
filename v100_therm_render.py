@@ -78,7 +78,8 @@ def main():
     # -- 1. capturar muestra actual
     temp = read_val('/tmp/conky_v100.dat', 'TEMP')
     fan = read_val('/tmp/conky_v100_fan.dat', 'RPM')
-    ts = os.time() if False else __import__('time').time()
+    import time as _t
+    ts = _t.time()
 
     hist = load_hist()
     if temp is not None and fan is not None:
