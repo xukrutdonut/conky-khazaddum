@@ -101,7 +101,6 @@ declare -A CONKY_INSTANCES=(
     [rpi4]="$CONKY_DIR/conky_rpi4.conf"
     [rpi3b]="$CONKY_DIR/conky_rpi3b.conf"
     [openrouter]="$CONKY_DIR/conky_openrouter.conf"
-    [ollama]="$CONKY_DIR/conky_ollama.conf"
     [nous]="$CONKY_DIR/conky_nous.conf"
     [containers]="$CONKY_DIR/conky_containers.conf"
 )
