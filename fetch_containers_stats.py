@@ -107,15 +107,21 @@ def log_ts(line):
         return 0.0
 
 
-def parse_ninfer_log():
-    """Cola de serve.log: (ultimo evento engine-ready, episodio de carga abierto).
+def alpha_prefix(word):
+    """Primera secuencia alfabetica en minuscula: 'qwen38-...'->'qwen', 'Gemma-4'->'gemma'."""
+    return ''.join(re.findall(r'[a-z]+', word.lower())[:1])
 
-    Evento = (ts_fin, dur_s) de "engine ready | NAME | total 1m 24.1s".
+
+def parse_ninfer_log():
+    """Cola de serve.log: (eventos engine-ready, episodio de carga abierto).
+
+    Evento = (ts_fin, dur_s, nombre_artefacto) de
+    "engine ready | NAME | total 1m 24.1s".
     Episodio = (ts_inicio, pct|None, ts_ultimo, eta_s|None) mientras haya lineas
     "loading weights" posteriores al ultimo evento. serve.log nombra el ARTEFACTO
-    (qwen3.8-35b-a3b-distill), no el id del router (qwen3.8-35b-a3b), asi que el
-    evento se atribuye al id que /v1/models reporte cargado en el ciclo siguiente
-    — con models-max 1 hay exactamente uno.
+    (qwen38-35b-a3b-distill), no el id del router (qwen3.8-35b-a3b): cada evento se
+    atribuye al id cuyo prefijo alfabetico coincide, y si no coincide ninguno y el
+    buffer solo tiene un candidato posible, al ultimo modelo cargado.
     """
     try:
         r = subprocess.run(
@@ -123,8 +129,8 @@ def parse_ninfer_log():
             capture_output=True, text=True, timeout=8)
         text = r.stdout or ''
     except Exception:
-        return None, None
-    ready = None
+        return [], None
+    events = []
     ep_start = ep_last = 0.0
     ep_pct = ep_eta = None
     for line in text.splitlines():
@@ -135,7 +141,7 @@ def parse_ninfer_log():
             m = re.search(r'total (.+?)\s*(?:\||$)', line)
             nm = re.search(r'engine ready \| ([^|]+?)\s*\|', line)
             if m:
-                ready = (ts, parse_dur(m.group(1)), (nm.group(1).strip() if nm else ''))
+                events.append((ts, parse_dur(m.group(1)), nm.group(1).strip() if nm else ''))
             ep_start = ep_last = 0.0
             ep_pct = ep_eta = None
         elif re.search(r'INFO\s+loading weights \|', line):
@@ -149,7 +155,7 @@ def parse_ninfer_log():
             ep_start = ep_start or ts
             ep_last = ts
     ep = (ep_start, ep_pct, ep_last, ep_eta) if ep_start else None
-    return ready, ep
+    return events, ep
 
 
 def emit_loads(lines, ninfer):
@@ -161,32 +167,20 @@ def emit_loads(lines, ninfer):
     sigue vivo, el render pinta una linea generica "swap en curso" con pct/ETA.
     """
     states = ninfer.get('swap') or []
-    ready, ep = parse_ninfer_log()
+    events, ep = parse_ninfer_log()
     now = time.time()
-    loaded_ids = [name for name, val in states
-                  if val in ('loaded', 'ready', 'running')]
-    if ready and ready[0] > 0 and loaded_ids:
-        seen = max([ts for _d, ts in _loads.values()] or [0.0])
-        if ready[0] > seen:
-            # atribuir AL id cuyo prefijo alfabetico coincida con el nombre del
-            # artefacto ('Gemma-4-26B...' -> gemma-4; 'qwen38-...' -> qwen3.8-...);
-            # si no coincide ninguno y solo hay un cargado, ese es.
-            def alpha(word):
-                return ''.join(re.findall(r'[a-z]+', word.lower())[:1])
-            name_ev = ready[2] if len(ready) > 2 else ''
-            pa = alpha(name_ev)
-            target = None
-            if pa:
-                cand = [i for i in loaded_ids if alpha(i) == pa]
-                if len(cand) == 1:
-                    target = cand
-            elif len(loaded_ids) == 1:
-                target = loaded_ids
-            if target:
-                for name in target:
-                    _loads[name] = (ready[1], ready[0])   # (duracion, ts_fin)
-                    _load_seen.pop(name, None)
-    if ep and ready and ep[0] < ready[0]:
+    # atribuir por prefijo alfabetico: el ultimo evento de cada prefijo es la
+    # ultima carga de su id (no depende de que el modelo este cargado AHORA,
+    # asi sobrevive reinicios del daemon y swaps entre ambos)
+    by_pref = {}
+    for name, _v in states:
+        by_pref.setdefault(alpha_prefix(name), []).append(name)
+    for ev_ts, ev_dur, ev_name in events:
+        cand = by_pref.get(alpha_prefix(ev_name))
+        if cand and len(cand) == 1:
+            _loads[cand[0]] = (ev_dur, ev_ts)
+            _load_seen.pop(cand[0], None)
+    if ep and events and ep[0] < events[-1][0]:
         ep = None
     lines.append(f'LOAD_COUNT:{len(states)}')
     for i, (name, val) in enumerate(states):
