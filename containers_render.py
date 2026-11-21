@@ -140,6 +140,31 @@ def fmt_age(sec):
     return f'{sec//3600}h{(sec%3600)//60:02d}'
 
 
+def console_section(data):
+    """Consola de actividad en vivo de ninfer (ultimas lineas de serve.log)."""
+    try:
+        n = int(data.get('CONSOLE_COUNT', '0') or 0)
+    except ValueError:
+        return
+    if not n:
+        return
+    print()
+    print("${color4}── Consola ninfer ──${color}")
+    for i in range(n):
+        kind = data.get(f'CONSOLE{i}_T', '')
+        txt = data.get(f'CONSOLE{i}_L', '')
+        if not txt:
+            continue
+        if 'stream' not in txt and kind == 'start':
+            print(f"${{color1}}{txt}${{color}}")
+        elif kind == 'thr':
+            print(f"${{color2}}{txt}${{color}}")
+        elif 'loading' in txt or 'engine ready' in txt:
+            print(f"${{color5}}{txt}${{color}}")
+        else:
+            print(f"${{color2}}{txt}${{color}}")
+
+
 def render():
     # Helpers siempre presentes: si faltan, Conky falla al evaluar execgraph
     write_helper('conky_intel_gpu_busy.sh', 'INTEL_GPU_BUSY')
@@ -242,6 +267,7 @@ def render():
             print(line)
 
     carga_section(data)
+    console_section(data)
 
 if __name__ == '__main__':
     render()

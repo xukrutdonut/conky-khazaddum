@@ -112,7 +112,18 @@ def alpha_prefix(word):
     return ''.join(re.findall(r'[a-z]+', word.lower())[:1])
 
 
-def parse_ninfer_log():
+def read_ninfer_log():
+    """Ultimos 256 KB de serve.log del contenedor (una sola lectura por ciclo)."""
+    try:
+        r = subprocess.run(
+            ['docker', 'exec', 'ninfer-serve', 'tail', '-c', '262144', '/tmp/serve.log'],
+            capture_output=True, text=True, timeout=8)
+        return r.stdout or ''
+    except Exception:
+        return ''
+
+
+def parse_ninfer_log(text):
     """Cola de serve.log: (eventos engine-ready, episodio de carga abierto).
 
     Evento = (ts_fin, dur_s, nombre_artefacto) de
@@ -123,13 +134,6 @@ def parse_ninfer_log():
     atribuye al id cuyo prefijo alfabetico coincide, y si no coincide ninguno y el
     buffer solo tiene un candidato posible, al ultimo modelo cargado.
     """
-    try:
-        r = subprocess.run(
-            ['docker', 'exec', 'ninfer-serve', 'tail', '-c', '262144', '/tmp/serve.log'],
-            capture_output=True, text=True, timeout=8)
-        text = r.stdout or ''
-    except Exception:
-        return [], None
     events = []
     ep_start = ep_last = 0.0
     ep_pct = ep_eta = None
@@ -158,7 +162,88 @@ def parse_ninfer_log():
     return events, ep
 
 
-def emit_loads(lines, ninfer):
+def fmt_tokrate(x):
+    """'809.3' | '1.06k' | '218.7' -> cadena compacta de tok/s."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return '?'
+    if v >= 1000:
+        return f'{v/1000:.1f}k'
+    return f'{v:.0f}'
+
+
+def abbrev_req(line):
+    """Abreviación de una linea req# del serve.log para caber en la columna de 48 chars."""
+    ts = ''
+    m = re.match(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})', line)
+    if m:
+        ts = m.group(1)[3:]  # mm:ss
+    if ' done | openai' in line:
+        pr = re.search(r'prompt (\d+)', line)
+        op = re.search(r'output (\d+)', line)
+        tot = re.search(r'total ([0-9.]+) ?(ms|s)', line)
+        dec = re.search(r'decode ([\d.]+k?) tok/s', line)
+        part = f'#{m_req(line)} {pr.group(1) if pr else "?"}→{op.group(1) if op else "?"}'
+        total = ''
+        if tot:
+            total = f'{tot.group(1)}{"ms" if tot.group(2)=="ms" else "s"}'
+        rate = f'{fmt_tokrate(dec.group(1))}t/s' if dec else ''
+        tail = '/'.join(x for x in (total, rate) if x)
+        if 'stream' in line:
+            part += ' [st]'
+        out = part
+        if tail:
+            out += f' {tail}'
+        return out
+    if ' started |' in line:
+        return f'#{m_req(line)} →'
+    if 'throughput |' in line:
+        pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
+        dec = re.search(r'decode ([\d.]+k?) tok/s', line)
+        run = re.search(r'running (\d+)', line)
+        bits = []
+        if pre: bits.append(f'pre {fmt_tokrate(pre.group(1))}')
+        if dec: bits.append(f'dec {fmt_tokrate(dec.group(1))}')
+        if run: bits.append(f'run {run.group(1)}')
+        return f'{ts} ' + ' · '.join(bits) if ts else ' · '.join(bits) + ' thr'
+    if 'engine ready' in line or 'loading weights' in line:
+        return line[10:58]
+    return ''
+
+
+def m_req(line):
+    m = re.search(r'req#(\d+)', line)
+    return m.group(1) if m else '?'
+
+
+def console_done(text, budget=6):
+    """Ultimas lineas de actividad del log, ya abreviadas (cronologicas, de la
+    mas reciente a la mas antigua). Devuelve lista ['$...|<abr>', ...] o []."""
+    lines = []
+    for raw in reversed(text.splitlines()):
+        if ' started |' in raw or ' done |' in raw or 'throughput |' in raw or 'engine ready' in raw or 'loading weights' in raw:
+            ab = abbrev_req(raw)
+            if ab:
+                lines.append((raw, ab))
+        if len(lines) >= budget:
+            break
+    lines.reverse()  # vuelvo al orden cronologico (mas antigua primero)
+    return lines
+
+
+def emit_console(lines, text):
+    """CONSOLE*: linea de actividad abreviada + tipo de color."""
+    act = console_done(text)
+    lines.append(f'CONSOLE_COUNT:{len(act)}')
+    for i, (raw, ab) in enumerate(act):
+        kind = 'start' if ' started |' in raw else ('done' if ' done |' in raw else ('thr' if 'throughput' in raw else 'load'))
+        lines.append(f'CONSOLE{i}_T:{kind}')
+        lines.append(f'CONSOLE{i}_L:{ab}')
+
+
+
+def emit_loads(lines, ninfer, text):
     """LOAD*: estado por modelo + duracion de su ultima carga + swap en curso.
 
     STATE: loaded (residente) | loading (la API reporta carga en marcha) |
@@ -167,7 +252,7 @@ def emit_loads(lines, ninfer):
     sigue vivo, el render pinta una linea generica "swap en curso" con pct/ETA.
     """
     states = ninfer.get('swap') or []
-    events, ep = parse_ninfer_log()
+    events, ep = parse_ninfer_log(text)
     now = time.time()
     # atribuir por prefijo alfabetico: el ultimo evento de cada prefijo es la
     # ultima carga de su id (no depende de que el modelo este cargado AHORA,
@@ -545,7 +630,9 @@ def build_dat(intel, ninfer):
     lines.append(f"NINFER_GPU_TEMP:{ninfer.get('gpu_temp', 0)}")
 
     gpu_hist(lines, intel, ninfer)
-    emit_loads(lines, ninfer)
+    text = read_ninfer_log()
+    emit_loads(lines, ninfer, text)
+    emit_console(lines, text)
 
     write_dat(lines)
 
