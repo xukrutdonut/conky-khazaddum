@@ -80,18 +80,16 @@ def fmt_dur(sec):
     return f'{sec}s'
 
 
-def carga_section(data):
-    """Por modelo: estado (carga activa / cargado / descargado) y duracion de
-    su ultima carga. La duracion real la da serve.log de ninfer
-    ("engine ready | ... | total 1m 24.1s"), no el muestreo de 5 s."""
+def models_load_state(data):
+    """Lista de modelos de ninfer no cargados (debajo del modelo activo en estado).
+    Solo los que estan descargados o cargando/swap en curso; el modelo cargado ya
+    se muestra como '▶ modelo' en la cabecera del estado."""
     try:
         n = int(data.get('LOAD_COUNT', '0') or 0)
     except ValueError:
-        return
+        n = 0
     if not n:
         return
-    print()
-    print("${color4}── Carga de modelos · V100 ──${color}")
     any_loading = False
     for i in range(n):
         name = data.get(f'LOAD{i}_NAME', '?')
@@ -100,18 +98,18 @@ def carga_section(data):
         ago = data.get(f'LOAD{i}_AGO', '')
         elap = data.get(f'LOAD{i}_ELAP', '')
         if st == 'loaded':
-            tag = "${color2}CARGADO${color}"
-        elif st == 'loading':
+            continue  # el activo ya esta en ▶ modelo
+        if st == 'loading':
             extra = f" {fmt_age(elap)}…" if elap else "…"
             tag = f"${{color5}}CARGANDO{extra}${{color}}"
             any_loading = True
         else:
             tag = "${color}descargado${color}"
-        line = f"{name:<16}{tag}"
+        line = f"   {name:<18}{tag}"
         if dur:
             line += f"${{color1}} · última carga:${{color}} ${{color2}}{fmt_dur(dur)}${{color}}"
             if ago:
-                line += f" ${{color1}}(hace {fmt_age(ago)})${{color}}"
+                line += f" ${{color1}}({fmt_age(ago)})${{color}}"
         print(line)
     ep = data.get('LOAD_EP', '')
     if ep and not any_loading:
@@ -126,7 +124,7 @@ def carga_section(data):
                 bits.append(f"{float(parts[1]):.0f}%")
             if len(parts) > 2 and parts[2]:
                 bits.append(f"ETA {fmt_dur(parts[2])}")
-            print(f"${{color5}}swap en curso${{color}} · ${{color1}}{' · '.join(bits)}${{color}}")
+            print(f"   ${{color5}}swap en curso${{color}} · ${{color1}}{' · '.join(bits)}${{color}}")
 
 
 def fmt_age(sec):
@@ -266,6 +264,7 @@ def render():
         ctx = data.get('NINFER_CTX', '0')
         short = model if len(model) <= 30 else model[:27] + '...'
         print(f"${{color2}}▶ {short}${{color}} ${{color1}}({quant}, ctx {ctx})${{color}}")
+        models_load_state(data)
         print(f"${{color1}}Workers: ${{color2}}{n_workers}${{color}}  "
               f"${{color1}}CPU: ${{color2}}{cpu}%${{color}}  "
               f"${{color1}}RAM: ${{color2}}{mem_u/1024:.1f}/{mem_t/1024:.1f} GB${{color}}")
@@ -278,7 +277,6 @@ def render():
         for line in gpu_panel(data, 'NINFER_GPU_UTIL', 'Uso GPU V100:', f' · {gpu_temp}°C'):
             print(line)
 
-    carga_section(data)
     console_section(data)
 
 if __name__ == '__main__':
