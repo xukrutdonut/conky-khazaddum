@@ -165,10 +165,10 @@ def console_section(data):
         txt = data.get(f'CONSOLE{i}_L', '')
         if not txt:
             continue
-        if 'stream' not in txt and kind == 'start':
-            print(f"${{color1}}{txt}${{color}}")
-        elif kind == 'thr':
+        if kind == 'thr':
             print(f"${{color2}}{txt}${{color}}")
+        elif kind == 'hi':
+            print(f"${{color1}}{txt}${{color}}")
         elif 'loading' in txt or 'engine ready' in txt:
             print(f"${{color5}}{txt}${{color}}")
         else:

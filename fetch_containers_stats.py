@@ -178,7 +178,9 @@ def fmt_tokrate(x):
 
 
 def abbrev_req(line):
-    """Linea de actividad legible: estado + peticion + tokens + tiempo + velocidad."""
+    """Linea de peticion destacada (grande/lenta/no-stop): identidad + motivo.
+    Las peticiones normales se omiten del listado (ruido); solo resaltan las
+    que superan umbrales o cierran con motivo distinto de 'stop token'."""
     ts = ''
     m = re.match(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})', line)
     if m:
@@ -188,38 +190,55 @@ def abbrev_req(line):
         op = re.search(r'output (\d+)', line)
         tot = re.search(r'total ([0-9.]+) ?(ms|s)', line)
         dec = re.search(r'decode ([\d.]+k?) tok/s', line)
-        msgs = re.search(r'(\d+) messages', line)
-        ident = f'#{m_req(line)}'
-        if msgs:
-            ident += f' · {msgs.group(1)} msgs'
+        reason = 'stop token'
+        rt = re.search(r'done \| openai-chat [^|]*\| ([a-z ]+) \| prompt', line)
+        if rt:
+            reason = rt.group(1).strip()
+        # ---- destacado? ----
+        out_n = int(op.group(1)) if op else 0
+        tot_s = 0.0
+        if tot:
+            tot_s = float(tot.group(1)) * (1.0 if tot.group(2) == 's' else 0.001)
+        crit = False
+        if out_n >= 400:
+            crit = True
+        if tot_s >= 4.0:
+            crit = True
+        if reason != 'stop token':
+            crit = True
+        if not crit:
+            return ''  # peticion normal: no satura el listado
         tok = f'{pr.group(1) if pr else "?"}→{op.group(1) if op else "?"} tok'
         total = ''
         if tot:
             total = f'{tot.group(1)}{"ms" if tot.group(2)=="ms" else "s"}'
         rate = f'{fmt_tokrate(dec.group(1))} tok/s' if dec else ''
         bits = ' · '.join(x for x in (tok, total, rate) if x)
-        st = ' [stream]' if 'stream' in line else ''
-        return f'✓ {ident}  {bits}{st}'
-    if ' started |' in line:
-        msgs = re.search(r'(\d+) messages', line)
-        mx = re.search(r'max output ([\d,]+)', line)
-        ident = f'#{m_req(line)}'
-        if mx:
-            ident += f' · máx {mx.group(1)}'
-        return f'▶ {ident} …'
-    if 'throughput |' in line:
-        pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
-        dec = re.search(r'decode ([\d.]+k?) tok/s', line)
-        run = re.search(r'running (\d+)', line)
-        bits = []
-        if pre: bits.append(f'prefill {fmt_tokrate(pre.group(1))}')
-        if dec: bits.append(f'decode {fmt_tokrate(dec.group(1))}')
-        if run: bits.append(f'{run.group(1)} activas')
-        prefix = f'{ts} ' if ts else ''
-        return prefix + ' · '.join(bits) + ' · resumen 5s'
-    if 'engine ready' in line or 'loading weights' in line:
-        return line[10:58]
+        extra = reason if reason != 'stop token' else ''
+        tail = ' '.join(x for x in (bits, extra) if x)
+        return f"↗ #{m_req(line)}  {tail}  [{ts or '?'}]"
+    if ' throughpur |' in line:  # trampa antitypo, inalcanzable
+        return ''
+    if ' stream ' in line:
+        return ''
     return ''
+
+
+def abbrev_resumen(line):
+    """Resumen de throughput (cada 5s): prefill + decode + activas."""
+    ts = ''
+    m = re.match(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})', line)
+    if m:
+        ts = m.group(1)[3:]  # mm:ss
+    pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
+    dec = re.search(r'decode ([\d.]+k?) tok/s', line)
+    run = re.search(r'running (\d+)', line)
+    bits = []
+    if pre: bits.append(f'prefill {fmt_tokrate(pre.group(1))}')
+    if dec: bits.append(f'decode {fmt_tokrate(dec.group(1))}')
+    if run: bits.append(f'{run.group(1)} en curso')
+    prefix = f'{ts} ' if ts else ''
+    return prefix + ' · '.join(bits)
 
 
 def m_req(line):
@@ -227,43 +246,35 @@ def m_req(line):
     return m.group(1) if m else '?'
 
 
-def console_done(text, minn=5, maxx=10):
-    """Lineas de actividad legibles, en orden cronologico.
-
-    Prioriza lineas informativas — completadas (✓), resumen de throughput y
-    eventos de carga — y solo usa 'en proceso' (▶) de relleno, para que con
-    muchas peticiones concurrentes no se llene la consola de 'en proceso…'.
-    Devuelve entre minn y maxx lineas (amplia la ventana hacia atras si falta)."""
+def console_done(text, minn=3, maxx=10):
+    """Lineas de la consola, en orden cronologico: resumen de throughput cada
+    5s (backbone, siempre que hay trafico) + solo peticiones destacadas
+    (grandes/lentas/no-stop). Las peticiones normales se omiten para que el
+    listado no sea un muro de '✓…' identico con trafico continuo."""
     prim, sec = [], []
     for raw in reversed(text.splitlines()):
-        if ' throughput ' in raw or 'engine ready' in raw or 'loading weights' in raw:
-            ab = abbrev_req(raw)
+        if 'throughput |' in raw or 'engine ready' in raw or 'loading weights' in raw:
+            ab = abbrev_resumen(raw)
             if ab:
                 prim.append((raw, ab))
         elif ' done |' in raw:
-            ab = abbrev_req(raw)
-            if ab:
-                prim.append((raw, ab))
-        elif ' started |' in raw:
-            ab = abbrev_req(raw)
+            ab = abbrev_req(raw)  # '' si es peticion normal
             if ab:
                 sec.append((raw, ab))
         if len(prim) >= maxx:
             break
-    # Rellenar solo con 'en proceso' si las primarias no llegan a maxx.
     entries = (prim + sec[: maxx - len(prim)])[:maxx]
-    entries.reverse()
+    entries.reverse()  # cronologico: mas antigua primero
     # Si faltan hasta minn, ampliar la ventana hacia atras en el log.
     if len(entries) < minn:
         extra = []
         seen = {raw for raw, _ in entries}
         for raw in reversed(text.splitlines()):
-            if ' throughput ' in raw or 'engine ready' in raw or 'loading weights' in raw or ' done |' in raw or ' started |' in raw:
-                if raw in seen:
-                    continue
-                ab = abbrev_req(raw)
-                if ab:
-                    extra.append((raw, ab))
+            if ' throughput ' not in raw or raw in seen:
+                continue
+            ab = abbrev_resumen(raw)
+            if ab:
+                extra.append((raw, ab))
                 if len(entries) + len(extra) >= minn:
                     break
         extra.reverse()
@@ -277,7 +288,7 @@ def emit_console(lines, text):
     act = console_done(text)
     lines.append(f'CONSOLE_COUNT:{len(act)}')
     for i, (raw, ab) in enumerate(act):
-        kind = 'start' if ' started |' in raw else ('done' if ' done |' in raw else ('thr' if 'throughput' in raw else 'load'))
+        kind = 'thr' if ('throughput' in raw or 'engine ready' in raw or 'loading weights' in raw) else 'hi'
         lines.append(f'CONSOLE{i}_T:{kind}')
         lines.append(f'CONSOLE{i}_L:{ab}')
     # running N: la linea throughput mas reciente del buffer indica cuantos
