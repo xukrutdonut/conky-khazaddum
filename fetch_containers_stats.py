@@ -225,8 +225,8 @@ def abbrev_resumen(line):
     dec = re.search(r'decode ([\d.]+k?) tok/s', line)
     run = re.search(r'running (\d+)', line)
     bits = []
-    if pre: bits.append(f'prefill {fmt_tokrate(pre.group(1))}')
-    if dec: bits.append(f'decode {fmt_tokrate(dec.group(1))}')
+    if pre: bits.append(f'prefill {fmt_tokrate(pre.group(1))} tok/s')
+    if dec: bits.append(f'decode {fmt_tokrate(dec.group(1))} tok/s')
     if run: bits.append(f'{run.group(1)} en curso')
     prefix = f'{ts} ' if ts else ''
     return prefix + ' · '.join(bits)
