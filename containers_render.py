@@ -168,7 +168,7 @@ def console_section(data):
         if kind == 'thr':
             print(f"${{color2}}{txt}${{color}}")
         elif kind == 'hi':
-            print(f"${{color1}}{txt}${{color}}")
+            print(f"${{color4}}{txt}${{color}}")
         elif 'loading' in txt or 'engine ready' in txt:
             print(f"${{color5}}{txt}${{color}}")
         else:

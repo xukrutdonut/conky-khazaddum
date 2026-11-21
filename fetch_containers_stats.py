@@ -203,15 +203,18 @@ def abbrev_req(line, force=False):
         crit = (out_n >= 400) or (tot_s >= 4.0) or (reason != 'stop token')
         if not force and not crit:
             return ''  # peticion normal: solo visible si force (ultima)
-        tok = f'{pr.group(1) if pr else "?"}→{op.group(1) if op else "?"} tok'
+        tok = f'{pr.group(1) if pr else "?"}->{op.group(1) if op else "?"} tok'
         total = ''
         if tot:
             total = f'{tot.group(1)}{"ms" if tot.group(2)=="ms" else "s"}'
         rate = f'{fmt_tokrate(dec.group(1))} tok/s' if dec else ''
         bits = ' · '.join(x for x in (tok, total, rate) if x)
         extra = reason if reason != 'stop token' else ''
-        tail = ' '.join(x for x in (bits, extra) if x)
-        return f"↗ #{m_req(line)}  {tail}  [{ts or '?'}]"
+        parts = [f"ID {m_req(line)}", bits]
+        if extra:
+            parts.append(extra)
+        parts.append(f"[{ts or '?'}]")
+        return ' · '.join(parts)
     return ''
 
 
