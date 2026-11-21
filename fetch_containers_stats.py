@@ -188,6 +188,10 @@ def abbrev_req(line):
         op = re.search(r'output (\d+)', line)
         tot = re.search(r'total ([0-9.]+) ?(ms|s)', line)
         dec = re.search(r'decode ([\d.]+k?) tok/s', line)
+        msgs = re.search(r'(\d+) messages', line)
+        ident = f'#{m_req(line)}'
+        if msgs:
+            ident += f' · {msgs.group(1)} msgs'
         tok = f'{pr.group(1) if pr else "?"}→{op.group(1) if op else "?"} tok'
         total = ''
         if tot:
@@ -195,9 +199,14 @@ def abbrev_req(line):
         rate = f'{fmt_tokrate(dec.group(1))} tok/s' if dec else ''
         bits = ' · '.join(x for x in (tok, total, rate) if x)
         st = ' [stream]' if 'stream' in line else ''
-        return f'✓  {bits}{st}'
+        return f'✓ {ident}  {bits}{st}'
     if ' started |' in line:
-        return f'▶  en proceso…'
+        msgs = re.search(r'(\d+) messages', line)
+        mx = re.search(r'max output ([\d,]+)', line)
+        ident = f'#{m_req(line)}'
+        if mx:
+            ident += f' · máx {mx.group(1)}'
+        return f'▶ {ident} …'
     if 'throughput |' in line:
         pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
         dec = re.search(r'decode ([\d.]+k?) tok/s', line)
@@ -211,6 +220,11 @@ def abbrev_req(line):
     if 'engine ready' in line or 'loading weights' in line:
         return line[10:58]
     return ''
+
+
+def m_req(line):
+    m = re.search(r'req#(\d+)', line)
+    return m.group(1) if m else '?'
 
 
 def console_done(text, minn=5, maxx=10):
