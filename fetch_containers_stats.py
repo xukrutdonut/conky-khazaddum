@@ -177,10 +177,11 @@ def fmt_tokrate(x):
     return f'{v:.0f}'
 
 
-def abbrev_req(line):
-    """Linea de peticion destacada (grande/lenta/no-stop): identidad + motivo.
-    Las peticiones normales se omiten del listado (ruido); solo resaltan las
-    que superan umbrales o cierran con motivo distinto de 'stop token'."""
+def abbrev_req(line, force=False):
+    """Linea de peticion individual con identidad + motivo.
+    force=True: formatea cualquier peticion (incluso corta/stop token) -> se usa
+    para la ultima peticion, siempre visible. force=False: solo destacadas
+    (grande/lenta/no-stop); las normales devuelven '' para no saturar."""
     ts = ''
     m = re.match(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})', line)
     if m:
@@ -199,15 +200,9 @@ def abbrev_req(line):
         tot_s = 0.0
         if tot:
             tot_s = float(tot.group(1)) * (1.0 if tot.group(2) == 's' else 0.001)
-        crit = False
-        if out_n >= 400:
-            crit = True
-        if tot_s >= 4.0:
-            crit = True
-        if reason != 'stop token':
-            crit = True
-        if not crit:
-            return ''  # peticion normal: no satura el listado
+        crit = (out_n >= 400) or (tot_s >= 4.0) or (reason != 'stop token')
+        if not force and not crit:
+            return ''  # peticion normal: solo visible si force (ultima)
         tok = f'{pr.group(1) if pr else "?"}→{op.group(1) if op else "?"} tok'
         total = ''
         if tot:
@@ -217,10 +212,6 @@ def abbrev_req(line):
         extra = reason if reason != 'stop token' else ''
         tail = ' '.join(x for x in (bits, extra) if x)
         return f"↗ #{m_req(line)}  {tail}  [{ts or '?'}]"
-    if ' throughpur |' in line:  # trampa antitypo, inalcanzable
-        return ''
-    if ' stream ' in line:
-        return ''
     return ''
 
 
@@ -247,10 +238,10 @@ def m_req(line):
 
 
 def console_done(text, minn=3, maxx=10):
-    """Lineas de la consola, en orden cronologico: resumen de throughput cada
-    5s (backbone, siempre que hay trafico) + solo peticiones destacadas
-    (grandes/lentas/no-stop). Las peticiones normales se omiten para que el
-    listado no sea un muro de '✓…' identico con trafico continuo."""
+    """Lineas de la consola, en orden cronologico: SIEMPRE la ultima peticion
+    individual completada (con identidad), + resumen de throughput cada 5s,
+    + peticiones destacadas extra (grandes/lentas/no-stop) si las hay."""
+    last_done = None
     prim, sec = [], []
     for raw in reversed(text.splitlines()):
         if 'throughput |' in raw or 'engine ready' in raw or 'loading weights' in raw:
@@ -258,27 +249,37 @@ def console_done(text, minn=3, maxx=10):
             if ab:
                 prim.append((raw, ab))
         elif ' done |' in raw:
-            ab = abbrev_req(raw)  # '' si es peticion normal
-            if ab:
-                sec.append((raw, ab))
+            if last_done is None:
+                ab = abbrev_req(raw, force=True)  # ultima: siempre visible
+                if ab:
+                    last_done = (raw, ab)
+            else:
+                ab = abbrev_req(raw)  # resto: solo si destacada
+                if ab:
+                    sec.append((raw, ab))
         if len(prim) >= maxx:
             break
-    entries = (prim + sec[: maxx - len(prim)])[:maxx]
-    entries.reverse()  # cronologico: mas antigua primero
-    # Si faltan hasta minn, ampliar la ventana hacia atras en el log.
+    entries = []
+    if last_done:
+        entries.append(last_done)
+    # Resumenes + destacadas extra hasta llenar maxx.
+    extra_pool = prim + sec
+    entries += extra_pool[: maxx - len(entries)]
+    entries.reverse()  # cronologico: mas antigua primero (la ultima peticion abajo)
+    # Si faltan hasta minn, ampliar la ventana hacia atras en el log con resumenes.
     if len(entries) < minn:
-        extra = []
+        more = []
         seen = {raw for raw, _ in entries}
         for raw in reversed(text.splitlines()):
-            if ' throughput ' not in raw or raw in seen:
+            if 'throughput' not in raw or raw in seen:
                 continue
             ab = abbrev_resumen(raw)
             if ab:
-                extra.append((raw, ab))
-                if len(entries) + len(extra) >= minn:
+                more.append((raw, ab))
+                if len(entries) + len(more) >= minn:
                     break
-        extra.reverse()
-        entries = (extra + entries)[:maxx]
+        more.reverse()
+        entries = (more + entries)[:maxx]
     return entries
 
 
