@@ -261,10 +261,10 @@ def console_done(text, minn=3, maxx=10):
     entries = []
     if last_done:
         entries.append(last_done)
-    # Resumenes + destacadas extra hasta llenar maxx.
     extra_pool = prim + sec
+    # Resumenes (ya en orden cronologico, mas antigua primero) tras la peticion.
     entries += extra_pool[: maxx - len(entries)]
-    entries.reverse()  # cronologico: mas antigua primero (la ultima peticion abajo)
+    # La peticion (con id) queda arriba, visible aunque la ventana recorte el fondo.
     # Si faltan hasta minn, ampliar la ventana hacia atras en el log con resumenes.
     if len(entries) < minn:
         more = []
