@@ -216,20 +216,19 @@ def abbrev_req(line, force=False):
 
 
 def abbrev_resumen(line):
-    """Resumen de throughput (cada 5s): prefill + decode + activas."""
+    """Resumen de throughput (cada 5s): prefill + decode, hora al final.
+    'en curso' se omite: el reloj de cuadraditos de la cabecera ya lo muestra."""
+    pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
+    dec = re.search(r'decode ([\d.]+k?) tok/s', line)
     ts = ''
     m = re.match(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})', line)
     if m:
         ts = m.group(1)[3:]  # mm:ss
-    pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
-    dec = re.search(r'decode ([\d.]+k?) tok/s', line)
-    run = re.search(r'running (\d+)', line)
     bits = []
     if pre: bits.append(f'prefill {fmt_tokrate(pre.group(1))} tok/s')
     if dec: bits.append(f'decode {fmt_tokrate(dec.group(1))} tok/s')
-    if run: bits.append(f'{run.group(1)} en curso')
-    prefix = f'{ts} ' if ts else ''
-    return prefix + ' · '.join(bits)
+    if ts: bits.append(f'[{ts}]')
+    return ' · '.join(bits)
 
 
 def m_req(line):
