@@ -119,9 +119,6 @@ while IFS= read -r _line; do
     [[ "$_mount" == *"/docker/"* || "$_mount" == *"/snap/"* || -z "$_mount" ]] && continue
     _seen_disk[$_dev]=1
 
-    # Preferir mountpoints /mnt/raid-* sobre nombres legacy del mismo device
-    _best=$(awk -v d="$_dev" '$1==d && $2~/\/mnt\/raid-/{print $2; exit}' /proc/mounts)
-    [[ -n "$_best" ]] && _mount="$_best"
     # Usar el mountpoint como nombre del disco (más legible que el device name)
     [[ "$_mount" == "/" ]] && _dname="root" || _dname=$(basename "$_mount")
 
