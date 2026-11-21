@@ -141,7 +141,9 @@ def fmt_age(sec):
 
 
 def console_section(data):
-    """Consola de actividad en vivo de ninfer (ultimas lineas de serve.log)."""
+    """Consola de actividad en vivo de ninfer (ultimas lineas de serve.log).
+    Cabeza: reloj de cuadraditos de capacidad fija (slots de concurrencia),
+    relleno = procesos en curso, vacio = slot libre."""
     try:
         n = int(data.get('CONSOLE_COUNT', '0') or 0)
     except ValueError:
@@ -150,6 +152,16 @@ def console_section(data):
         return
     print()
     print("${color4}── Consola ninfer ──${color}")
+    # Reloj de cuadraditos: 4 slots de concurrencia (max-concurrency del router).
+    CAP = 4
+    try:
+        run = int(data.get('CONSOLE_RUN', '0') or 0)
+    except ValueError:
+        run = 0
+    run = max(0, min(CAP, run))
+    cells = '${color2}' + '█' * run + '${color}' + '░' * (CAP - run)
+    print(f"${{color1}}en curso:${{color}} {cells}"
+          f"  ${{color2}}{run}/{CAP}${{color}}")
     for i in range(n):
         kind = data.get(f'CONSOLE{i}_T', '')
         txt = data.get(f'CONSOLE{i}_L', '')

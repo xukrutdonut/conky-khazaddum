@@ -272,13 +272,24 @@ def console_done(text, minn=5, maxx=10):
 
 
 def emit_console(lines, text):
-    """CONSOLE*: linea de actividad abreviada + tipo de color (min 5, max 10)."""
+    """CONSOLE*: linea de actividad abreviada + tipo de color (min 5, max 10).
+    CONSOLE_RUN: procesos en curso (running N de la ultima linea throughput)."""
     act = console_done(text)
     lines.append(f'CONSOLE_COUNT:{len(act)}')
     for i, (raw, ab) in enumerate(act):
         kind = 'start' if ' started |' in raw else ('done' if ' done |' in raw else ('thr' if 'throughput' in raw else 'load'))
         lines.append(f'CONSOLE{i}_T:{kind}')
         lines.append(f'CONSOLE{i}_L:{ab}')
+    # running N: la linea throughput mas reciente del buffer indica cuantos
+    # procesos hay en curso (prefill + decode en el slot). Se usa de tope.
+    run = 0
+    for raw in reversed(text.splitlines()):
+        if 'throughput |' in raw:
+            m = re.search(r'running (\d+)', raw)
+            if m:
+                run = int(m.group(1))
+            break
+    lines.append(f'CONSOLE_RUN:{run}')
 
 
 
