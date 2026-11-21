@@ -163,9 +163,13 @@ def parse_ninfer_log(text):
 
 
 def fmt_tokrate(x):
-    """'809.3' | '1.06k' | '218.7' -> cadena compacta de tok/s."""
+    """'809.3' | '1070' | '1.07k' -> cadena compacta de tok/s (soporta sufijo k)."""
     try:
-        v = float(x)
+        s = str(x).strip().lower()
+        mult = 1000.0 if s.endswith('k') else 1.0
+        if s.endswith('k'):
+            s = s[:-1]
+        v = float(s) * mult
     except (TypeError, ValueError):
         return '?'
     if v >= 1000:
@@ -174,7 +178,7 @@ def fmt_tokrate(x):
 
 
 def abbrev_req(line):
-    """Abreviación de una linea req# del serve.log para caber en la columna de 48 chars."""
+    """Linea de actividad legible: estado + peticion + tokens + tiempo + velocidad."""
     ts = ''
     m = re.match(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})', line)
     if m:
@@ -184,56 +188,77 @@ def abbrev_req(line):
         op = re.search(r'output (\d+)', line)
         tot = re.search(r'total ([0-9.]+) ?(ms|s)', line)
         dec = re.search(r'decode ([\d.]+k?) tok/s', line)
-        part = f'#{m_req(line)} {pr.group(1) if pr else "?"}→{op.group(1) if op else "?"}'
+        tok = f'{pr.group(1) if pr else "?"}→{op.group(1) if op else "?"} tok'
         total = ''
         if tot:
             total = f'{tot.group(1)}{"ms" if tot.group(2)=="ms" else "s"}'
-        rate = f'{fmt_tokrate(dec.group(1))}t/s' if dec else ''
-        tail = '/'.join(x for x in (total, rate) if x)
-        if 'stream' in line:
-            part += ' [st]'
-        out = part
-        if tail:
-            out += f' {tail}'
-        return out
+        rate = f'{fmt_tokrate(dec.group(1))} tok/s' if dec else ''
+        bits = ' · '.join(x for x in (tok, total, rate) if x)
+        st = ' [stream]' if 'stream' in line else ''
+        return f'✓  {bits}{st}'
     if ' started |' in line:
-        return f'#{m_req(line)} →'
+        return f'▶  en proceso…'
     if 'throughput |' in line:
         pre = re.search(r'prefill ([\d.]+k?) tok/s', line)
         dec = re.search(r'decode ([\d.]+k?) tok/s', line)
         run = re.search(r'running (\d+)', line)
         bits = []
-        if pre: bits.append(f'pre {fmt_tokrate(pre.group(1))}')
-        if dec: bits.append(f'dec {fmt_tokrate(dec.group(1))}')
-        if run: bits.append(f'run {run.group(1)}')
-        return f'{ts} ' + ' · '.join(bits) if ts else ' · '.join(bits) + ' thr'
+        if pre: bits.append(f'prefill {fmt_tokrate(pre.group(1))}')
+        if dec: bits.append(f'decode {fmt_tokrate(dec.group(1))}')
+        if run: bits.append(f'{run.group(1)} activas')
+        prefix = f'{ts} ' if ts else ''
+        return prefix + ' · '.join(bits) + ' · resumen 5s'
     if 'engine ready' in line or 'loading weights' in line:
         return line[10:58]
     return ''
 
 
-def m_req(line):
-    m = re.search(r'req#(\d+)', line)
-    return m.group(1) if m else '?'
+def console_done(text, minn=5, maxx=10):
+    """Lineas de actividad legibles, en orden cronologico.
 
-
-def console_done(text, budget=6):
-    """Ultimas lineas de actividad del log, ya abreviadas (cronologicas, de la
-    mas reciente a la mas antigua). Devuelve lista ['$...|<abr>', ...] o []."""
-    lines = []
+    Prioriza lineas informativas — completadas (✓), resumen de throughput y
+    eventos de carga — y solo usa 'en proceso' (▶) de relleno, para que con
+    muchas peticiones concurrentes no se llene la consola de 'en proceso…'.
+    Devuelve entre minn y maxx lineas (amplia la ventana hacia atras si falta)."""
+    prim, sec = [], []
     for raw in reversed(text.splitlines()):
-        if ' started |' in raw or ' done |' in raw or 'throughput |' in raw or 'engine ready' in raw or 'loading weights' in raw:
+        if ' throughput ' in raw or 'engine ready' in raw or 'loading weights' in raw:
             ab = abbrev_req(raw)
             if ab:
-                lines.append((raw, ab))
-        if len(lines) >= budget:
+                prim.append((raw, ab))
+        elif ' done |' in raw:
+            ab = abbrev_req(raw)
+            if ab:
+                prim.append((raw, ab))
+        elif ' started |' in raw:
+            ab = abbrev_req(raw)
+            if ab:
+                sec.append((raw, ab))
+        if len(prim) >= maxx:
             break
-    lines.reverse()  # vuelvo al orden cronologico (mas antigua primero)
-    return lines
+    # Rellenar solo con 'en proceso' si las primarias no llegan a maxx.
+    entries = (prim + sec[: maxx - len(prim)])[:maxx]
+    entries.reverse()
+    # Si faltan hasta minn, ampliar la ventana hacia atras en el log.
+    if len(entries) < minn:
+        extra = []
+        seen = {raw for raw, _ in entries}
+        for raw in reversed(text.splitlines()):
+            if ' throughput ' in raw or 'engine ready' in raw or 'loading weights' in raw or ' done |' in raw or ' started |' in raw:
+                if raw in seen:
+                    continue
+                ab = abbrev_req(raw)
+                if ab:
+                    extra.append((raw, ab))
+                if len(entries) + len(extra) >= minn:
+                    break
+        extra.reverse()
+        entries = (extra + entries)[:maxx]
+    return entries
 
 
 def emit_console(lines, text):
-    """CONSOLE*: linea de actividad abreviada + tipo de color."""
+    """CONSOLE*: linea de actividad abreviada + tipo de color (min 5, max 10)."""
     act = console_done(text)
     lines.append(f'CONSOLE_COUNT:{len(act)}')
     for i, (raw, ab) in enumerate(act):
