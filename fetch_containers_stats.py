@@ -15,6 +15,13 @@ DAT_FILE = '/tmp/conky_containers.dat'
 INTERVAL = 5          # poll cada 5s
 INTEL_PORT = 8006
 NINFER_NAME = 'ninfer-serve'
+VLLM_NAME = 'vllm-1cat'
+VLLM_PORT = 8001
+
+# --- contadores previos para derivar tok/s del /metrics de vLLM ---
+# (generation_tokens_total es un contador de vida de la instancia; el daemon
+# guarda el ultimo valor + su timestamp para calcular el ritmo de decode)
+_vllm_prev = {}
 
 # --- histórico persistido (revive del commit c61f97c; se perdió en a90bd83) ---
 # 180 muestras x 5 s = 15 min; se agrega por máximos a SPARK_W columnas para que
@@ -361,12 +368,13 @@ def emit_loads(lines, ninfer, text):
     hist_save()
 
 
-def gpu_hist(lines, intel, ninfer):
+def gpu_hist(lines, intel, ninfer, vllm):
     """Empuja el histórico de uso GPU y añade las filas SPARK que lee el render."""
     gu = intel.get('gpu_usage') or {}
     hist_push('INTEL_GPU_BUSY', float(gu.get('gpu_busy', 0) or 0))
     hist_push('NINFER_GPU_UTIL', float(ninfer.get('gpu_util', 0) or 0))
-    for key in ('INTEL_GPU_BUSY', 'NINFER_GPU_UTIL'):
+    hist_push('VLLM_GPU_UTIL', float(vllm.get('gpu_util', 0) or 0))
+    for key in ('INTEL_GPU_BUSY', 'NINFER_GPU_UTIL', 'VLLM_GPU_UTIL'):
         lines.append(f'{key}_SPARK:{spark(key)}')
     hist_save()
 
@@ -648,7 +656,88 @@ def collect_intel():
             'swap': [(m['name'], 1) for m in loaded_models]}
 
 
-def build_dat(intel, ninfer):
+def collect_vllm():
+    """Recolecta estado + metricas Prometheus del contenedor vllm-1cat (:8001).
+
+    vLLM expone /metrics en formato Prometheus (prefijo vllm:) y /v1/models
+    (OpenAI). La GPU es la misma V100 que ninfer, pero vllm y ninfer NO
+    coexisten: solo corre uno a la vez, asi que la VRAM/UTIL de la V100 se
+    lee del mismo /tmp/conky_v100.dat y se atribuye al que este activo.
+    """
+    running, status = docker_status(VLLM_NAME)
+    out = {'running': running, 'status': status,
+           'model': '', 'n_running': 0, 'n_waiting': 0,
+           'kv_pct': 0.0, 'gen_tps': 0.0,
+           'vram_used': 0.0, 'vram_total': 0.0, 'gpu_util': 0.0, 'gpu_temp': 0.0}
+    if not running:
+        return out
+    vs = read_v100_gpu_stats()
+    if vs:
+        out['vram_used'] = float(vs.get('MEMUSED', 0)) / 1024.0
+        out['vram_total'] = float(vs.get('MEMTOTAL', 32768)) / 1024.0
+        out['gpu_util'] = float(vs.get('UTIL', 0))
+        out['gpu_temp'] = float(vs.get('TEMP', 0))
+    try:
+        mdl = http_get_json(f'http://127.0.0.1:{VLLM_PORT}/v1/models')
+        d = (mdl or {}).get('data') or []
+        if d and isinstance(d[0], dict) and d[0].get('id'):
+            out['model'] = d[0]['id']
+    except Exception:
+        pass
+    metrics = http_get_metrics(f'http://127.0.0.1:{VLLM_PORT}/metrics')
+    out['n_running'] = metrics.get('vllm:num_requests_running', 0)
+    out['n_waiting'] = metrics.get('vllm:num_requests_waiting', 0)
+    out['kv_pct'] = metrics.get('vllm:kv_cache_usage_perc', 0.0) * 100.0
+    # ritmo de generacion (decode) por delta del contador entre polls
+    gen = metrics.get('vllm:generation_tokens_total')
+    now = time.time()
+    prev_v, prev_t = _vllm_prev.get('gen'), _vllm_prev.get('ts')
+    out['gen_tps'] = 0.0
+    if gen is not None and prev_v is not None and prev_t is not None:
+        dt = now - prev_t
+        if dt >= INTERVAL * 0.5 and gen >= prev_v:
+            out['gen_tps'] = round((gen - prev_v) / dt, 1)
+    _vllm_prev['gen'] = gen
+    _vllm_prev['ts'] = now
+    return out
+
+
+def http_get_metrics(url, timeout=5):
+    """Parsea /metrics de Prometheus: dict nombre->ultimo valor numerico.
+
+    Devuelve la muestra mas reciente de cada metrica vllm: (la adecuada para
+    gauges y el acumulado para counters). Los histogramas (_bucket/_sum/_count)
+    se ignoran excepto _count que es la unica serie que leemos.
+    """
+    try:
+        r = subprocess.run(['curl', '-s', '--max-time', str(timeout), url],
+                           capture_output=True, text=True, timeout=timeout + 2)
+        if r.returncode != 0:
+            return {}
+    except Exception:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith('#'):
+            continue
+        # "vllm:nombre{labels} valor"
+        name, _, rest = line.partition('{')
+        rest = rest.rsplit('}', 1)[-1].strip()
+        if not name.startswith('vllm:'):
+            continue
+        if any(name.endswith(sfx) for sfx in ('_bucket', '_sum', '_count')):
+            # vllm:request_success_total{...} no acaba en esos; el histograma
+            # _count lo tratamos con su nombre base mapeado mas abajo
+            continue
+        try:
+            out[name] = float(rest)
+        except ValueError:
+            continue
+    return out
+
+
+def build_dat(intel, ninfer, vllm):
     lines = []
     lines.append(f"INTEL_RUNNING:{1 if intel['running'] else 0}")
     lines.append(f"INTEL_STATUS:{intel['status']}")
@@ -693,10 +782,22 @@ def build_dat(intel, ninfer):
     lines.append(f"NINFER_GPU_UTIL:{ninfer.get('gpu_util', 0)}")
     lines.append(f"NINFER_GPU_TEMP:{ninfer.get('gpu_temp', 0)}")
 
-    gpu_hist(lines, intel, ninfer)
+    gpu_hist(lines, intel, ninfer, vllm)
     text = read_ninfer_log()
     emit_loads(lines, ninfer, text)
     emit_console(lines, text)
+
+    lines.append(f"VLLM_RUNNING:{1 if vllm['running'] else 0}")
+    lines.append(f"VLLM_STATUS:{vllm['status']}")
+    lines.append(f"VLLM_MODEL:{vllm['model']}")
+    lines.append(f"VLLM_RUNNING_REQ:{vllm['n_running']}")
+    lines.append(f"VLLM_WAIT_REQ:{vllm['n_waiting']}")
+    lines.append(f"VLLM_KV_PCT:{vllm['kv_pct']:.0f}")
+    lines.append(f"VLLM_GEN_TPS:{vllm['gen_tps']}")
+    lines.append(f"VLLM_VRAM_USED:{vllm['vram_used']:.0f}")
+    lines.append(f"VLLM_VRAM_TOTAL:{vllm['vram_total']:.0f}")
+    lines.append(f"VLLM_GPU_UTIL:{vllm['gpu_util']}")
+    lines.append(f"VLLM_GPU_TEMP:{vllm['gpu_temp']}")
 
     write_dat(lines)
 
@@ -707,7 +808,8 @@ def main():
         try:
             intel = collect_intel()
             ninfer = collect_ninfer()
-            build_dat(intel, ninfer)
+            vllm = collect_vllm()
+            build_dat(intel, ninfer, vllm)
         except Exception as e:
             print(f"Error in loop: {e}")
             time.sleep(1)

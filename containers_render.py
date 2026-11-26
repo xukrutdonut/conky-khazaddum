@@ -277,6 +277,34 @@ def render():
         for line in gpu_panel(data, 'NINFER_GPU_UTIL', 'Uso GPU V100:', f' · {gpu_temp}°C'):
             print(line)
 
+    # ══════════ vLLM 1Cat — V100 :8001 ══════════
+    print()
+    print("${color4}── vLLM 1Cat — NVIDIA V100 ──${color}")
+    running = data.get('VLLM_RUNNING', '0') == '1'
+    if not running:
+        print(f"${{color3}}Estado: {data.get('VLLM_STATUS', 'unknown')}${{color}}")
+        print("${color1}:8001${color}  ${color3}DETENIDO${color}")
+    else:
+        model = data.get('VLLM_MODEL', '?')
+        short = model if len(model) <= 30 else model[:27] + '...'
+        n_run = int(float(data.get('VLLM_RUNNING_REQ', '0')))
+        n_wait = int(float(data.get('VLLM_WAIT_REQ', '0')))
+        kv_pct = float(data.get('VLLM_KV_PCT', '0'))
+        gen_tps = float(data.get('VLLM_GEN_TPS', '0'))
+        total_vram = float(data.get('VLLM_VRAM_TOTAL', '0'))
+        used_vram = float(data.get('VLLM_VRAM_USED', '0'))
+        gpu_temp = int(float(data.get('VLLM_GPU_TEMP', '0')))
+        print(f"${{color2}}▶ {short}${{color}}")
+        kv_col = 'color2'
+        print(f"${{color1}}KV cache: ${{{kv_col}}}{kv_pct:.0f}%${{color}}  "
+              f"${{color1}}en curso: ${{color2}}{n_run}${{color}}  "
+              f"${{color1}}cola: ${{color2}}{n_wait}${{color}}  "
+              f"${{color1}}gen: ${{color2}}{gen_tps:.0f} t/s${{color}}")
+        if total_vram > 0:
+            print(f"${{color1}}VRAM: ${{color2}}{used_vram:.0f}/{total_vram:.0f} GB${{color}}")
+        for line in gpu_panel(data, 'VLLM_GPU_UTIL', 'Uso GPU vLLM:', f' · {gpu_temp}°C'):
+            print(line)
+
     console_section(data)
 
 if __name__ == '__main__':
