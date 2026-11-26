@@ -47,7 +47,7 @@ echo "[$(date '+%H:%M:%S')] Using DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-def
 # PRE-CREATE DAEMON DATA
 # ==============================================================================
 
-touch /tmp/conky_arc.dat /tmp/conky_npu.dat /tmp/conky_diskio.dat /tmp/conky_v100.dat 2>/dev/null || true
+touch /tmp/conky_diskio.dat /tmp/conky_v100.dat 2>/dev/null || true
 
 # Los daemons de GPU (v100_stats.sh, rx480_stats.sh) se ejecutan como unidades
 # systemd --user (conky-v100-stats), igual que npu-daemon
